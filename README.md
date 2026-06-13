@@ -4,14 +4,14 @@ Pooled, autonomous, market-cap-weighted index vault on Ethereum mainnet. Users e
 
 ## Status
 
-Phases 1 and 2 of the six-phase build plan (SPEC Section 13) are implemented and tested.
+Phases 1 through 3 of the six-phase build plan (SPEC Section 13) are implemented and tested.
 
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 1 | Core vault: ERC-7540 async superset of ERC-4626, NAV, buffer, PendingSilo, settle | Done |
 | 2 | Methodology engine: market-cap weighting, iterative capping, floor, buffer rule | Done |
-| 3 | Layered supply oracle (on-chain derivation, median with freeze, containment) | Next |
-| 4 | Rebalancer and Composable CoW order handler | Planned |
+| 3 | Layered supply oracle (on-chain derivation, median with freeze, containment) | Done |
+| 4 | Rebalancer and Composable CoW order handler | Next |
 | 5 | Fees, timelocks, guardian pause | Planned |
 | 6 | Mainnet-fork end-to-end at index-10 | Planned |
 
@@ -21,7 +21,7 @@ Phases 1 and 2 of the six-phase build plan (SPEC Section 13) are implemented and
 - `PendingSilo` isolates in-flight value (unsettled deposit USDC, escrowed shares, claimable balances) so the vault's NAV is structurally clean rather than corrected by bookkeeping.
 - `ComponentRegistry` holds constituents with per-feed Chainlink heartbeats. Every price read is health-checked and stale data makes price-sensitive operations revert.
 - `MarketCapMethodology` implements `IMethodology`: float-adjusted market cap weighting with a hard per-asset cap redistributed iteratively to convergence, plus a minimum-weight floor that prunes dust positions. The capping math lives in the pure `WeightMath` library with exact invariants: weights sum to exactly 1e18, no weight exceeds the cap, and infeasible configurations revert instead of degrading.
-- `ISupplyOracle` is the seam for the Phase 3 layered supply oracle, which is the protocol's central risk and is specified in SPEC Section 8.
+- The supply oracle is the protocol's central risk (SPEC Section 8) and is built in three layers behind the `ISupplyOracle` seam. `ExcludedAddressRegistry` (Layer 1) derives circulating supply on-chain as `totalSupply - Σ balanceOf(excluded)`, converting "trust a number" into "trust a timelocked list of addresses," with `totalSupply` as a free trustless upper bound. `SupplyOracle` (Layers 2 and 3) secures the residual free-float factor through a multi-source reporter median that freezes the constituent at last-good when sources diverge, then contains it with a per-commit rate-limit, a hard staleness ceiling, and a guardian pause. Because the factor is capped at 1e18, free-float can never exceed the on-chain floor by construction.
 
 ## Development
 
@@ -32,4 +32,4 @@ forge build
 forge test
 ```
 
-The test suite covers the full async request, settle, and claim lifecycle, buffer-band gating of the sync lanes, oracle staleness fail-closed behavior, settlement liveness and flash-loan guards, and property fuzzing of the capping algorithm.
+The test suite (75 tests) covers the full async request, settle, and claim lifecycle, buffer-band gating of the sync lanes, oracle staleness fail-closed behavior, settlement liveness and flash-loan guards, property fuzzing of the capping algorithm, and adversarial supply-oracle scenarios (divergence freeze, rate-limit clamp convergence, timelocked exclusions, guardian pause), including an end-to-end test driving the methodology through the real layered supply oracle.
