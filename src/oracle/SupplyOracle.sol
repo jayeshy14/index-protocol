@@ -35,6 +35,12 @@ error SupplyOracle_NotEnoughFreshReports(address token, uint256 fresh, uint256 r
 /// divergence freeze. The commit reverts, so last-good persists untouched.
 error SupplyOracle_SourcesDiverged(address token, uint256 spreadBps, uint256 toleranceBps);
 
+/// @notice Thrown when commit is called again before minCommitInterval has
+/// elapsed since the token's last successful commit. This makes the rate-limit
+/// per-time rather than per-call, so the factor cannot be walked to the median
+/// by repeated permissionless commits inside a single block.
+error SupplyOracle_CommitTooSoon(address token, uint256 nextAllowedAt);
+
 error SupplyOracle_AlreadyReporter(address reporter);
 error SupplyOracle_UnknownReporter(address reporter);
 error SupplyOracle_TooManyReporters();
@@ -66,11 +72,14 @@ error SupplyOracle_InvalidParams();
  * constituent without the methodology engine noticing (spec Section 8.2).
  *
  * Layer 3, contain. The committed factor moves toward the median by at most
- * `maxFactorDeltaBps` per commit, so a correct-but-large change is approached
- * gradually and a malicious spike cannot move the index more than one step
- * before a human reacts. A hard `maxCommitAge` ceiling fails the read closed
- * if every reporter has gone silent for too long, and the guardian can pause
- * all reads outright.
+ * `maxFactorDeltaBps` per commit, and a `minCommitInterval` cooldown spreads
+ * those commits across time, so the factor moves at most one step per interval
+ * however often commit is called, and a malicious spike cannot move the index
+ * more than one step before a human reacts. The cooldown is load-bearing:
+ * without it, commit being permissionless and cooldown-free would let anyone
+ * walk the factor to the median with repeated calls in a single block. A hard
+ * `maxCommitAge` ceiling fails the read closed if every reporter has gone
+ * silent for too long, and the guardian can pause all reads outright.
  */
 contract SupplyOracle is ISupplyOracle, Ownable2Step {
     using Math for uint256;
@@ -126,6 +135,12 @@ contract SupplyOracle is ISupplyOracle, Ownable2Step {
     /// @notice Maximum per-commit move of the factor, in bps of the prior factor.
     uint256 public maxFactorDeltaBps = 1000;
 
+    /// @notice Minimum wall-clock seconds between successful commits for a token.
+    /// Combined with the per-commit clamp, this bounds the factor's rate of
+    /// change to one maxStep per interval regardless of how often commit is
+    /// called, which is what gives a human time to react to a malicious move.
+    uint256 public minCommitInterval = 1 hours;
+
     event GuardianSet(address indexed guardian);
     event PausedSet(bool paused);
     event ReporterAdded(address indexed reporter);
@@ -137,7 +152,8 @@ contract SupplyOracle is ISupplyOracle, Ownable2Step {
         uint256 divergenceToleranceBps,
         uint256 reportStaleAfter,
         uint256 maxCommitAge,
-        uint256 maxFactorDeltaBps
+        uint256 maxFactorDeltaBps,
+        uint256 minCommitInterval
     );
 
     modifier onlyReporter() {
@@ -212,6 +228,16 @@ contract SupplyOracle is ISupplyOracle, Ownable2Step {
     function commit(address token) external {
         if (paused) revert SupplyOracle_Paused();
 
+        // Per-time rate-limit. A token's factor cannot be committed again until
+        // minCommitInterval has elapsed since its last successful commit. This
+        // is what turns the per-commit clamp below into an actual rate limit:
+        // without it, commit being permissionless and cooldown-free would let
+        // anyone walk the factor to the median with repeated calls in one block.
+        Committed memory prev = committed[token];
+        if (prev.initialized && block.timestamp < uint256(prev.timestamp) + minCommitInterval) {
+            revert SupplyOracle_CommitTooSoon(token, uint256(prev.timestamp) + minCommitInterval);
+        }
+
         // Gather fresh reporter values.
         uint256 n = _reporterList.length;
         uint256[] memory fresh = new uint256[](n);
@@ -249,8 +275,8 @@ contract SupplyOracle is ISupplyOracle, Ownable2Step {
         }
 
         // Layer 3 rate-limit: clamp the move toward the median so a large jump
-        // is approached over several commits rather than landing at once.
-        Committed memory prev = committed[token];
+        // is approached over several commits, each at least minCommitInterval
+        // apart (enforced above), rather than landing at once.
         uint256 next = median;
         if (prev.initialized) {
             uint256 maxStep = prev.factorWad.mulDiv(maxFactorDeltaBps, BPS, Math.Rounding.Floor);
@@ -320,12 +346,13 @@ contract SupplyOracle is ISupplyOracle, Ownable2Step {
         uint256 divergenceToleranceBps_,
         uint256 reportStaleAfter_,
         uint256 maxCommitAge_,
-        uint256 maxFactorDeltaBps_
+        uint256 maxFactorDeltaBps_,
+        uint256 minCommitInterval_
     ) external onlyOwner {
         if (
             minReporters_ == 0 || minReporters_ > MAX_REPORTERS || divergenceToleranceBps_ > BPS
                 || reportStaleAfter_ == 0 || maxCommitAge_ < reportStaleAfter_ || maxFactorDeltaBps_ == 0
-                || maxFactorDeltaBps_ > BPS
+                || maxFactorDeltaBps_ > BPS || minCommitInterval_ == 0 || minCommitInterval_ > maxCommitAge_
         ) {
             revert SupplyOracle_InvalidParams();
         }
@@ -334,7 +361,15 @@ contract SupplyOracle is ISupplyOracle, Ownable2Step {
         reportStaleAfter = reportStaleAfter_;
         maxCommitAge = maxCommitAge_;
         maxFactorDeltaBps = maxFactorDeltaBps_;
-        emit ParamsSet(minReporters_, divergenceToleranceBps_, reportStaleAfter_, maxCommitAge_, maxFactorDeltaBps_);
+        minCommitInterval = minCommitInterval_;
+        emit ParamsSet(
+            minReporters_,
+            divergenceToleranceBps_,
+            reportStaleAfter_,
+            maxCommitAge_,
+            maxFactorDeltaBps_,
+            minCommitInterval_
+        );
     }
 
     // ========================================================================
