@@ -36,7 +36,7 @@ error IndexVault_SettleIntervalNotPassed();
 error IndexVault_RequestBlockDelayNotPassed();
 
 /// @notice Thrown when the idle buffer cannot cover the epoch's pending redemptions.
-/// @dev Until the Phase 4 rebalancer can free USDC from the basket, settlement
+/// @dev Until the rebalancer can free USDC from the basket, settlement
 /// requires the buffer to cover net outflows.
 error IndexVault_InsufficientSettlementLiquidity(uint256 required, uint256 available);
 
@@ -72,10 +72,7 @@ error IndexVault_InvalidSettleParams();
  * operations revert rather than transact on bad data.
  *
  * Pending redemptions are priced at settle time, not request time, which is
- * fairer to remaining holders (spec Section 12, decision 1).
- *
- * Phase 1 scope: no methodology engine, no rebalancer, no fees. Target
- * weights and basket deployment arrive in Phases 2 and 4.
+ * fairer to remaining holders.
  */
 contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     using SafeERC20 for IERC20;
@@ -536,7 +533,7 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     }
 
     /// @notice Sets the buffer band. Low and high gate the sync lanes; target
-    /// is the level the Phase 4 rebalancer tops the buffer back toward.
+    /// is the level the rebalancer tops the buffer back toward.
     function setBufferBand(uint16 lowBps, uint16 targetBps, uint16 highBps) external onlyOwner {
         if (lowBps == 0 || lowBps > targetBps || targetBps > highBps || highBps >= BPS) {
             revert IndexVault_InvalidBufferBand();

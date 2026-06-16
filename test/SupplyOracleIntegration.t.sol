@@ -111,7 +111,7 @@ contract SupplyOracleIntegrationTest is Test {
         assertEq(sum, WAD);
     }
 
-    /// @notice Section 8.4: a capped constituent's weight is independent of its
+    /// @notice A capped constituent's weight is independent of its
     /// supply-oracle value. Move BTC's free-float factor through the full
     /// committed range and its weight never leaves the cap.
     function test_CapNeutralizesSupplyOracleOnLargeConstituent() public {

@@ -50,7 +50,7 @@ error ComponentRegistry_UsdcFeedNotSet();
  * non-positive answer reverts so that price-sensitive vault operations
  * (mint, settle, rebalance) fail closed instead of transacting on bad data.
  * @dev Prices are normalized to 8 decimals regardless of feed decimals.
- * Supply-oracle bindings and reconstitution metadata land here in Phase 3.
+ * Supply-oracle bindings and reconstitution metadata land here later.
  */
 contract ComponentRegistry is Ownable2Step {
     struct Component {
@@ -111,7 +111,7 @@ contract ComponentRegistry is Ownable2Step {
     /// @notice Removes a constituent from the registry.
     /// @dev The vault may still hold a balance of a removed token; removal only
     /// stops it being valued and traded. Deregistration policy (forced exit of
-    /// the position first) is enforced at the rebalancer layer in Phase 4.
+    /// the position first) is enforced at the rebalancer layer.
     function removeComponent(address token) external onlyOwner {
         if (_components[token].token == address(0)) revert ComponentRegistry_NotRegistered(token);
 

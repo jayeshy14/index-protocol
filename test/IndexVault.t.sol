@@ -66,7 +66,7 @@ contract IndexVaultTest is Test {
     }
 
     /// @dev Simulates a deployed basket: 1 WBTC ($100k) + 20 WETH ($100k)
-    /// held by the vault, as the Phase 4 rebalancer would leave it.
+    /// held by the vault, as the rebalancer would leave it.
     function _seedBasket() internal {
         wbtc.mint(address(vault), 1e8);
         weth.mint(address(vault), 20e18);
