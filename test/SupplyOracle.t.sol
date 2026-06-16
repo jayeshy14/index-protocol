@@ -19,7 +19,8 @@ import {
     SupplyOracle_SourcesDiverged,
     SupplyOracle_FactorAboveOne,
     SupplyOracle_NotReporter,
-    SupplyOracle_NotGuardian
+    SupplyOracle_NotGuardian,
+    SupplyOracle_CommitTooSoon
 } from "src/oracle/SupplyOracle.sol";
 import { MockERC20 } from "test/mocks/MockERC20.sol";
 
@@ -272,6 +273,43 @@ contract SupplyOracleTest is Test {
         (uint256 finalFactor,,) = oracle.freeFloatFactor(address(token));
         assertGe(finalFactor, 0.45e18);
         assertLt(finalFactor, 0.6e18);
+    }
+
+    /// @notice The rate-limit must be per-time, not per-call. commit is
+    /// permissionless, so without a cooldown an attacker could call it
+    /// repeatedly in one block, each call reading the freshly-written factor
+    /// and advancing another step, walking it to the median in a single block
+    /// and erasing the human-reaction window the clamp is meant to preserve.
+    function test_RateLimit_PerTimeNotPerCommit_BlocksSameBlockWalk() public {
+        _exclude(treasury);
+        _exclude(vesting);
+        _reportAll(0.9e18, 0.9e18, 0.9e18);
+        oracle.commit(address(token)); // initial commit, factor 0.90
+
+        // Reporters agree on a large drop. This is the malicious-spike case the
+        // rate-limit exists to slow down.
+        vm.warp(block.timestamp + oracle.minCommitInterval());
+        _reportAll(0.45e18, 0.45e18, 0.45e18);
+        oracle.commit(address(token));
+        (uint256 afterOne,,) = oracle.freeFloatFactor(address(token));
+        assertEq(afterOne, 0.81e18, "first commit should move exactly one clamped step");
+
+        // A second commit in the SAME block must revert. This is the regression
+        // guard: previously it would have advanced another step off the just
+        // written 0.81, and a loop could reach 0.45 within the block.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SupplyOracle_CommitTooSoon.selector, address(token), block.timestamp + oracle.minCommitInterval()
+            )
+        );
+        oracle.commit(address(token));
+
+        // The factor only advances once the cooldown has elapsed.
+        vm.warp(block.timestamp + oracle.minCommitInterval());
+        oracle.commit(address(token));
+        (uint256 afterTwo,,) = oracle.freeFloatFactor(address(token));
+        assertLt(afterTwo, afterOne, "second step should apply only after the cooldown");
+        assertEq(afterTwo, afterOne - afterOne * oracle.maxFactorDeltaBps() / 10_000, "not a single clamped step");
     }
 
     function test_HardStaleness_ReadRevertsPastMaxCommitAge() public {
