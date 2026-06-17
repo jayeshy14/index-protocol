@@ -71,7 +71,7 @@ contract MarketCapMethodologyTest is Test {
 
     function test_GetWeights_UncappedMatchesRawMarketCapRatio() public {
         // Lift the cap out of the way to verify the raw weighting alone.
-        methodology.setWeightParams(WAD, 1);
+        methodology.setWeightParams(WAD, WAD, 1);
         uint256[] memory w = methodology.getWeights(tokens);
 
         // Total $2.701T: BTC 2000/2701, ETH 600/2701, SOL 100/2701, TAIL 1/2701.
@@ -112,7 +112,7 @@ contract MarketCapMethodologyTest is Test {
 
     function test_GetWeights_FloorPrunesDustPosition() public {
         // 40% cap so the index is not fully degenerate, tail floor at 0.05%.
-        methodology.setWeightParams(0.4e18, 5e14);
+        methodology.setWeightParams(0.4e18, 0.4e18, 5e14);
         // Shrink TAIL to a dust market cap ($100M against $2.7T).
         supplyOracle.setSupply(address(tail), 100_000_000);
 
@@ -156,16 +156,40 @@ contract MarketCapMethodologyTest is Test {
         methodology.getWeights(single);
     }
 
+    function test_CapParams_Defaults() public view {
+        // The target is what getWeights caps to; the trigger is the wider
+        // actual-weight threshold the rebalancer reads for hysteresis.
+        assertEq(methodology.capTargetWad(), 0.25e18);
+        assertEq(methodology.capTriggerWad(), 0.3e18);
+        assertEq(methodology.floorWad(), 1e14);
+        assertGt(methodology.capTriggerWad(), methodology.capTargetWad());
+    }
+
     function test_SetWeightParams_Validates() public {
+        // Zero cap target is invalid.
         vm.expectRevert(MarketCapMethodology_InvalidParams.selector);
-        methodology.setWeightParams(0, 0);
+        methodology.setWeightParams(0, 0.3e18, 0);
 
+        // Floor at or above the cap target is invalid.
         vm.expectRevert(MarketCapMethodology_InvalidParams.selector);
-        methodology.setWeightParams(0.2e18, 0.2e18);
+        methodology.setWeightParams(0.2e18, 0.2e18, 0.2e18);
 
+        // Trigger below the cap target is invalid.
+        vm.expectRevert(MarketCapMethodology_InvalidParams.selector);
+        methodology.setWeightParams(0.3e18, 0.2e18, 1e14);
+
+        // Trigger above 1e18 is invalid.
+        vm.expectRevert(MarketCapMethodology_InvalidParams.selector);
+        methodology.setWeightParams(0.3e18, WAD + 1, 1e14);
+
+        // Trigger equal to target is allowed (hysteresis disabled).
+        methodology.setWeightParams(0.3e18, 0.3e18, 1e14);
+        assertEq(methodology.capTriggerWad(), 0.3e18);
+
+        // Non-owner cannot set params.
         vm.prank(makeAddr("rando"));
         vm.expectRevert();
-        methodology.setWeightParams(0.3e18, 1e14);
+        methodology.setWeightParams(0.3e18, 0.35e18, 1e14);
     }
 
     /// @notice End-to-end weighting invariants under fuzzed prices and supplies.
@@ -187,7 +211,7 @@ contract MarketCapMethodologyTest is Test {
 
         uint256 sum = 0;
         for (uint256 i = 0; i < 4; i++) {
-            assertLe(w[i], methodology.capWad());
+            assertLe(w[i], methodology.capTargetWad());
             assertTrue(w[i] == 0 || w[i] >= methodology.floorWad());
             sum += w[i];
         }

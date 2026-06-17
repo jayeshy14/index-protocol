@@ -163,16 +163,17 @@ contract SupplyOracleTest is Test {
     function test_Commit_MedianOfFreshReports() public {
         _exclude(treasury);
         _exclude(vesting); // circulating = 600,000
-        // Reports cluster within the 2% tolerance; median is the middle value.
+        // Reports cluster within the 2% tolerance; median is the middle value,
+        // 0.92, which the EFF rounding snaps to the nearest 5% tier, 0.90.
         _reportAll(0.91e18, 0.92e18, 0.93e18);
         oracle.commit(address(token));
 
         (uint256 factor,, bool frozen) = oracle.freeFloatFactor(address(token));
-        assertEq(factor, 0.92e18, "median not committed");
+        assertEq(factor, 0.9e18, "median not committed at the rounded tier");
         assertFalse(frozen);
 
-        // free-float = 600,000 * 0.92 = 552,000
-        assertEq(oracle.getFreeFloatSupply(address(token)), 552_000);
+        // free-float = 600,000 * 0.90 = 540,000
+        assertEq(oracle.getFreeFloatSupply(address(token)), 540_000);
     }
 
     function test_Commit_RevertsBelowQuorum() public {
@@ -213,7 +214,8 @@ contract SupplyOracleTest is Test {
         _exclude(vesting);
         _reportAll(0.91e18, 0.92e18, 0.93e18);
         oracle.commit(address(token));
-        assertEq(oracle.getFreeFloatSupply(address(token)), 600_000 * 92 / 100);
+        // Median 0.92 rounds to the 0.90 tier, so free-float = 600,000 * 0.90.
+        assertEq(oracle.getFreeFloatSupply(address(token)), 600_000 * 90 / 100);
 
         // All three reporters now disagree wildly: median 0.60, and neither
         // 0.30 nor 0.92 sits within the 2% band, so fewer than two agree.
@@ -225,9 +227,9 @@ contract SupplyOracleTest is Test {
         );
         oracle.commit(address(token));
 
-        // Last-good factor untouched: the freeze held.
+        // Last-good factor untouched: the freeze held (at the rounded 0.90 tier).
         (uint256 factor,,) = oracle.freeFloatFactor(address(token));
-        assertEq(factor, 0.92e18);
+        assertEq(factor, 0.9e18);
     }
 
     /// @notice The median is robust to a single captured reporter: a 2-of-3
@@ -381,5 +383,54 @@ contract SupplyOracleTest is Test {
 
         uint256 circulating = registry.onChainCirculating(address(token));
         assertLe(oracle.getFreeFloatSupply(address(token)), circulating);
+    }
+
+    // ========================================================================
+    // Float-factor rounding (CRSP EFF tiers)
+    // ========================================================================
+
+    /// @notice A float wiggle within the same tier does not move the committed
+    /// factor, while a change that crosses a tier does. This is what suppresses
+    /// needless re-weighting on small, noisy float changes.
+    function test_FloatRounding_WiggleWithinTierIsNoOp() public {
+        _exclude(treasury);
+        _exclude(vesting);
+
+        // 0.90 is tier-aligned (nearest 5%).
+        _reportAll(0.9e18, 0.9e18, 0.9e18);
+        oracle.commit(address(token));
+        (uint256 f0,,) = oracle.freeFloatFactor(address(token));
+        assertEq(f0, 0.9e18);
+
+        // 0.91 rounds back to the 0.90 tier, so the committed factor does not move.
+        vm.warp(block.timestamp + oracle.minCommitInterval());
+        _reportAll(0.91e18, 0.91e18, 0.91e18);
+        oracle.commit(address(token));
+        (uint256 f1,,) = oracle.freeFloatFactor(address(token));
+        assertEq(f1, 0.9e18, "in-tier wiggle moved the factor");
+
+        // 0.93 crosses into the 0.95 tier, so the factor does move.
+        vm.warp(block.timestamp + oracle.minCommitInterval());
+        _reportAll(0.93e18, 0.93e18, 0.93e18);
+        oracle.commit(address(token));
+        (uint256 f2,,) = oracle.freeFloatFactor(address(token));
+        assertEq(f2, 0.95e18, "tier-crossing change did not round to 0.95");
+    }
+
+    /// @notice The committed factor is always tier-aligned at steady state, and
+    /// a nonzero factor never rounds to zero.
+    function testFuzz_FloatRounding_StaysTierAlignedAndNonzero(uint256 factorSeed) public {
+        uint256 factor = bound(factorSeed, 1, WAD);
+        _reportAll(factor, factor, factor);
+        // The first commit has no prior value, so the clamp does not apply and
+        // the committed factor is exactly the rounded target.
+        oracle.commit(address(token));
+
+        (uint256 committedFactor,,) = oracle.freeFloatFactor(address(token));
+        assertGt(committedFactor, 0, "nonzero factor rounded to zero");
+        assertLe(committedFactor, WAD);
+        // Aligned to one of the three tiers.
+        uint256 tier = committedFactor >= 1e17 ? 5e16 : (committedFactor >= 1e16 ? 1e16 : 1e15);
+        assertEq(committedFactor % tier, 0, "committed factor not tier-aligned");
     }
 }
