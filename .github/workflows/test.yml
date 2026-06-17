@@ -35,4 +35,8 @@ jobs:
         run: forge build --sizes
 
       - name: Run Forge tests
-        run: forge test -vvv
+        run: forge test -vvv --no-match-path "test/*Fork*"
+
+      - name: Run Forge fork tests (best-effort, needs mainnet RPC)
+        run: forge test -vvv --match-path "test/*Fork*"
+        continue-on-error: true
