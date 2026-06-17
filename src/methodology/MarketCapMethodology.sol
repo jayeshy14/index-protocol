@@ -31,15 +31,15 @@ error MarketCapMethodology_InvalidParams();
 /**
  * @title MarketCapMethodology
  * @notice Reference IMethodology implementation: float-adjusted market-cap
- * weighting with a hard per-asset cap, iteratively redistributed (spec
- * Section 5.3), and a minimum-weight floor that prunes dust positions. This
- * is standard index-provider methodology (capped market-cap with float
- * adjustment), which almost no on-chain index implements correctly.
+ * weighting with a hard per-asset cap, iteratively redistributed, and a
+ * minimum-weight floor that prunes dust positions. This is standard
+ * index-provider methodology (capped market-cap with float adjustment),
+ * which almost no on-chain index implements correctly.
  *
  * The cap does security work beyond diversification: large constituents are
  * pinned at the cap regardless of their exact supply, so supply-oracle
  * precision only matters for the mid and long tail, where the value at risk
- * from manipulation is smaller (spec Section 8.4).
+ * from manipulation is smaller.
  */
 contract MarketCapMethodology is IMethodology, Ownable2Step {
     using Math for uint256;
@@ -55,7 +55,7 @@ contract MarketCapMethodology is IMethodology, Ownable2Step {
     /// supply arrived in native token decimals instead of whole tokens.
     uint256 public constant MARKET_CAP_SANITY_BOUND = 1e30;
 
-    /// @notice Hard per-asset weight cap in WAD. Default 25% (spec Section 12).
+    /// @notice Hard per-asset weight cap in WAD. Default 25%.
     uint256 public capWad = 0.25e18;
 
     /// @notice Minimum weight in WAD below which a constituent is pruned to
@@ -102,7 +102,7 @@ contract MarketCapMethodology is IMethodology, Ownable2Step {
     }
 
     /// @notice Sets the per-asset cap and the minimum-weight floor.
-    /// @dev Methodology-admin lever; sits behind the Phase 5 timelock.
+    /// @dev Methodology-admin lever; sits behind the methodology-admin timelock.
     /// The cap must be feasible for the constituent set: getWeights reverts
     /// with WeightMath_CapInfeasible when the number of nonzero-market-cap
     /// constituents k satisfies k * capWad < 1e18 (a 25% cap needs at least

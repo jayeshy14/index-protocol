@@ -5,7 +5,7 @@ pragma solidity 0.8.28;
  * @title ISupplyOracle
  * @notice Source of float-adjusted circulating supply per constituent. The
  * methodology engine consumes an already-float-adjusted figure and does not
- * itself decide float (spec Section 5.2). The implementation layers on-chain
+ * itself decide float. The implementation layers on-chain
  * derivation, a multi-source median with divergence freeze, and containment
  * guards behind this interface, so the methodology never needs to know how
  * the number was secured.

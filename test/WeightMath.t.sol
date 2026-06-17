@@ -52,7 +52,7 @@ contract WeightMathTest is Test {
     }
 
     // ========================================================================
-    // applyCap, property fuzz (spec Section 13 phase 2)
+    // applyCap, property fuzz
     // ========================================================================
 
     /// @notice For any normalized weight vector and feasible cap: the output

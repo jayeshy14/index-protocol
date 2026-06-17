@@ -48,7 +48,7 @@ error SupplyOracle_InvalidParams();
 
 /**
  * @title SupplyOracle
- * @notice Layers 2 and 3 of the supply-oracle design (spec Section 8), built
+ * @notice Layers 2 and 3 of the supply-oracle design, built
  * on the Layer 1 on-chain derivation in ExcludedAddressRegistry.
  *
  * Free-float supply is expressed as
@@ -69,7 +69,7 @@ error SupplyOracle_InvalidParams();
  * disagree, the commit reverts and the constituent freezes at its last-good
  * factor rather than acting on disputed data. This interface is shaped so an
  * optimistic oracle can later replace the reporter-median residual per
- * constituent without the methodology engine noticing (spec Section 8.2).
+ * constituent without the methodology engine noticing.
  *
  * Layer 3, contain. The committed factor moves toward the median by at most
  * `maxFactorDeltaBps` per commit, and a `minCommitInterval` cooldown spreads
@@ -102,7 +102,7 @@ contract SupplyOracle is ISupplyOracle, Ownable2Step {
     /// @notice Layer 1 on-chain circulating-supply source.
     ExcludedAddressRegistry public immutable EXCLUDED;
 
-    /// @notice Guardian with pause-only powers (spec Section 10).
+    /// @notice Guardian with pause-only powers.
     address public guardian;
 
     /// @notice When true, every read fails closed.

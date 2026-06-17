@@ -31,7 +31,7 @@ error ExcludedRegistry_InvalidDelay(uint256 delay);
 
 /**
  * @title ExcludedAddressRegistry
- * @notice Layer 1 of the supply oracle (spec Section 8.1): minimize the
+ * @notice Layer 1 of the supply oracle: minimize the
  * off-chain surface by deriving circulating supply on-chain wherever possible.
  *
  * Circulating supply is computed directly as
@@ -107,7 +107,7 @@ contract ExcludedAddressRegistry is Ownable2Step {
     }
 
     /// @notice Cancels a pending change before it executes. The owner today,
-    /// the guardian once Phase 5 wires fast pause powers in.
+    /// the guardian once fast pause powers are wired in.
     function cancelChange(address token, address account, bool exclude) external onlyOwner {
         bytes32 id = changeId(token, account, exclude);
         if (!pendingChanges[id].exists) revert ExcludedRegistry_NoPendingChange(id);

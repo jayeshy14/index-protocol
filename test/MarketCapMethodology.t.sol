@@ -100,7 +100,7 @@ contract MarketCapMethodologyTest is Test {
     }
 
     function test_GetWeights_CapDoesSecurityWork() public {
-        // Spec Section 8.4: a manipulated supply on a capped constituent must
+        // A manipulated supply on a capped constituent must
         // not move its weight. Double BTC's reported supply; BTC stays at cap.
         uint256[] memory before = methodology.getWeights(tokens);
         supplyOracle.setSupply(address(wbtc), 40_000_000);

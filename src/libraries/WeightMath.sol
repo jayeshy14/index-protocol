@@ -7,7 +7,7 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
  * @title WeightMath
  * @notice Pure index-weighting math: iterative cap-and-redistribute, exact
  * renormalization, and the minimum-weight floor. This is the textbook capped
- * market-cap methodology (spec Section 5.3): a hard per-asset cap with the
+ * market-cap methodology: a hard per-asset cap with the
  * overflow redistributed pro-rata to uncapped constituents, iterated because
  * redistribution can push a previously-uncapped name over the cap.
  *
@@ -177,7 +177,7 @@ library WeightMath {
     }
 
     // ========================================================================
-    // Reconstitution buffer rule (spec Section 5.4)
+    // Reconstitution buffer rule
     // ========================================================================
 
     /**
