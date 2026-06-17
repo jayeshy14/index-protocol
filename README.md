@@ -77,9 +77,9 @@ This is a research-stage codebase. It is not audited and it is not deployed. The
 
 ```
 src/
-  IndexVault.sol              ERC-7540 two-lane vault, NAV, settlement
+  IndexVault.sol              ERC-7540 two-lane vault, NAV, settlement, curated constituents
   PendingSilo.sol             isolated holder of in-flight value
-  ComponentRegistry.sol       constituents and health-checked Chainlink feeds
+  AssetRegistry.sol           shared asset catalog and health-checked Chainlink feeds
   methodology/
     MarketCapMethodology.sol  float-adjusted capped market-cap weighting
   libraries/

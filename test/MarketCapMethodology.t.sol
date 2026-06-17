@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 
-import { ComponentRegistry } from "src/ComponentRegistry.sol";
+import { AssetRegistry } from "src/AssetRegistry.sol";
 import {
     MarketCapMethodology,
     MarketCapMethodology_MarketCapExceedsSanityBound,
@@ -19,7 +19,7 @@ contract MarketCapMethodologyTest is Test {
     uint256 internal constant WAD = 1e18;
     uint48 internal constant HEARTBEAT = 1 days;
 
-    ComponentRegistry internal registry;
+    AssetRegistry internal registry;
     MockSupplyOracle internal supplyOracle;
     MarketCapMethodology internal methodology;
 
@@ -48,11 +48,11 @@ contract MarketCapMethodologyTest is Test {
         solFeed = new MockAggregator(8, 200e8);
         tailFeed = new MockAggregator(8, 1e8);
 
-        registry = new ComponentRegistry(address(this));
-        registry.registerComponent(address(wbtc), address(wbtcFeed), HEARTBEAT);
-        registry.registerComponent(address(weth), address(wethFeed), HEARTBEAT);
-        registry.registerComponent(address(sol), address(solFeed), HEARTBEAT);
-        registry.registerComponent(address(tail), address(tailFeed), HEARTBEAT);
+        registry = new AssetRegistry(address(this));
+        registry.registerAsset(address(wbtc), address(wbtcFeed), HEARTBEAT);
+        registry.registerAsset(address(weth), address(wethFeed), HEARTBEAT);
+        registry.registerAsset(address(sol), address(solFeed), HEARTBEAT);
+        registry.registerAsset(address(tail), address(tailFeed), HEARTBEAT);
 
         supplyOracle = new MockSupplyOracle();
         // Whole-token units per the ISupplyOracle contract.
@@ -140,7 +140,7 @@ contract MarketCapMethodologyTest is Test {
     function test_GetWeights_RevertsOnUnsetSupply() public {
         MockERC20 unknown = new MockERC20("Unknown", "UNK", 18);
         MockAggregator unknownFeed = new MockAggregator(8, 1e8);
-        registry.registerComponent(address(unknown), address(unknownFeed), HEARTBEAT);
+        registry.registerAsset(address(unknown), address(unknownFeed), HEARTBEAT);
         tokens.push(address(unknown));
 
         vm.expectRevert();

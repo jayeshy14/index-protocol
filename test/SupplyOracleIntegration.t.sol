@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 
-import { ComponentRegistry } from "src/ComponentRegistry.sol";
+import { AssetRegistry } from "src/AssetRegistry.sol";
 import { ExcludedAddressRegistry } from "src/oracle/ExcludedAddressRegistry.sol";
 import { SupplyOracle } from "src/oracle/SupplyOracle.sol";
 import { MarketCapMethodology } from "src/methodology/MarketCapMethodology.sol";
@@ -18,7 +18,7 @@ contract SupplyOracleIntegrationTest is Test {
     uint48 internal constant HEARTBEAT = 1 days;
     uint256 internal constant DELAY = 2 days;
 
-    ComponentRegistry internal components;
+    AssetRegistry internal components;
     ExcludedAddressRegistry internal excluded;
     SupplyOracle internal oracle;
     MarketCapMethodology internal methodology;
@@ -57,11 +57,11 @@ contract SupplyOracleIntegrationTest is Test {
         feeds[2] = new MockAggregator(8, 2e8);
         feeds[3] = new MockAggregator(8, 2e8);
 
-        components = new ComponentRegistry(address(this));
-        components.registerComponent(address(wbtc), address(feeds[0]), HEARTBEAT);
-        components.registerComponent(address(weth), address(feeds[1]), HEARTBEAT);
-        components.registerComponent(address(tailA), address(feeds[2]), HEARTBEAT);
-        components.registerComponent(address(tailB), address(feeds[3]), HEARTBEAT);
+        components = new AssetRegistry(address(this));
+        components.registerAsset(address(wbtc), address(feeds[0]), HEARTBEAT);
+        components.registerAsset(address(weth), address(feeds[1]), HEARTBEAT);
+        components.registerAsset(address(tailA), address(feeds[2]), HEARTBEAT);
+        components.registerAsset(address(tailB), address(feeds[3]), HEARTBEAT);
 
         excluded = new ExcludedAddressRegistry(address(this), DELAY);
         oracle = new SupplyOracle(excluded, guardian, address(this));
