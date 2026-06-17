@@ -5,7 +5,7 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
-import { ComponentRegistry } from "src/ComponentRegistry.sol";
+import { AssetRegistry } from "src/AssetRegistry.sol";
 import { IMethodology } from "src/interfaces/IMethodology.sol";
 import { ISupplyOracle } from "src/interfaces/ISupplyOracle.sol";
 import { WeightMath } from "src/libraries/WeightMath.sol";
@@ -44,8 +44,8 @@ error MarketCapMethodology_InvalidParams();
 contract MarketCapMethodology is IMethodology, Ownable2Step {
     using Math for uint256;
 
-    /// @notice Price registry for constituent USD prices (8 decimals).
-    ComponentRegistry public immutable REGISTRY;
+    /// @notice Shared asset catalog for constituent USD prices (8 decimals).
+    AssetRegistry public immutable REGISTRY;
 
     /// @notice Float-adjusted circulating supply source, in whole tokens.
     ISupplyOracle public immutable SUPPLY_ORACLE;
@@ -65,7 +65,7 @@ contract MarketCapMethodology is IMethodology, Ownable2Step {
 
     event WeightParamsSet(uint256 capWad, uint256 floorWad);
 
-    constructor(ComponentRegistry registry, ISupplyOracle supplyOracle, address initialOwner) Ownable(initialOwner) {
+    constructor(AssetRegistry registry, ISupplyOracle supplyOracle, address initialOwner) Ownable(initialOwner) {
         if (address(registry) == address(0) || address(supplyOracle) == address(0)) {
             revert MarketCapMethodology_ZeroAddress();
         }

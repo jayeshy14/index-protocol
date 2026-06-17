@@ -6,7 +6,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC4626 } from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 
 import { IndexVault } from "src/IndexVault.sol";
-import { ComponentRegistry } from "src/ComponentRegistry.sol";
+import { AssetRegistry } from "src/AssetRegistry.sol";
 import {
     IndexVault_NotKeeper,
     IndexVault_SettleIntervalNotPassed,
@@ -14,9 +14,11 @@ import {
     IndexVault_InsufficientSettlementLiquidity,
     IndexVault_RequestNotSettled,
     IndexVault_NotAuthorized,
-    IndexVault_InvalidBufferBand
+    IndexVault_InvalidBufferBand,
+    IndexVault_AssetNotRegistered,
+    IndexVault_DuplicateConstituent
 } from "src/IndexVault.sol";
-import { ComponentRegistry_StalePrice } from "src/ComponentRegistry.sol";
+import { AssetRegistry_StalePrice } from "src/AssetRegistry.sol";
 import { MockERC20 } from "test/mocks/MockERC20.sol";
 import { MockAggregator } from "test/mocks/MockAggregator.sol";
 
@@ -29,7 +31,7 @@ contract IndexVaultTest is Test {
     MockAggregator internal wbtcFeed;
     MockAggregator internal wethFeed;
 
-    ComponentRegistry internal registry;
+    AssetRegistry internal registry;
     IndexVault internal vault;
 
     address internal keeper = makeAddr("keeper");
@@ -50,12 +52,18 @@ contract IndexVaultTest is Test {
         wbtcFeed = new MockAggregator(8, 100_000e8); // $100k
         wethFeed = new MockAggregator(8, 5_000e8); // $5k
 
-        registry = new ComponentRegistry(address(this));
+        registry = new AssetRegistry(address(this));
         registry.setUsdcFeed(address(usdc), address(usdcFeed), HEARTBEAT);
-        registry.registerComponent(address(wbtc), address(wbtcFeed), HEARTBEAT);
-        registry.registerComponent(address(weth), address(wethFeed), HEARTBEAT);
+        registry.registerAsset(address(wbtc), address(wbtcFeed), HEARTBEAT);
+        registry.registerAsset(address(weth), address(wethFeed), HEARTBEAT);
 
         vault = new IndexVault(IERC20(address(usdc)), registry, keeper, address(this));
+
+        // Curate this index's constituents (a subset of the catalog).
+        address[] memory constituents = new address[](2);
+        constituents[0] = address(wbtc);
+        constituents[1] = address(weth);
+        vault.setConstituents(constituents);
 
         usdc.mint(alice, 1_000_000e6);
         usdc.mint(bob, 1_000_000e6);
@@ -114,7 +122,7 @@ contract IndexVaultTest is Test {
         vm.warp(block.timestamp + HEARTBEAT + 1);
         vm.expectRevert(
             abi.encodeWithSelector(
-                ComponentRegistry_StalePrice.selector, address(usdcFeed), block.timestamp - HEARTBEAT - 1, HEARTBEAT
+                AssetRegistry_StalePrice.selector, address(usdcFeed), block.timestamp - HEARTBEAT - 1, HEARTBEAT
             )
         );
         vault.totalAssets();
@@ -482,5 +490,102 @@ contract IndexVaultTest is Test {
         vault.redeem(shares, alice, alice);
 
         assertLe(usdc.balanceOf(alice) - balBefore, assets);
+    }
+
+    // ========================================================================
+    // Constituents (curated membership) and multi-index
+    // ========================================================================
+
+    function _constituentArray(address a, address b) internal pure returns (address[] memory arr) {
+        arr = new address[](2);
+        arr[0] = a;
+        arr[1] = b;
+    }
+
+    function test_GetConstituents_ReflectsCuratedSet() public view {
+        address[] memory cons = vault.getConstituents();
+        assertEq(cons.length, 2);
+        assertEq(cons[0], address(wbtc));
+        assertEq(cons[1], address(weth));
+        assertEq(vault.constituentCount(), 2);
+        assertTrue(vault.isConstituent(address(wbtc)));
+        assertFalse(vault.isConstituent(address(usdc)));
+    }
+
+    function test_SetConstituents_RevertsOnUnregisteredAsset() public {
+        MockERC20 stray = new MockERC20("Stray", "STR", 18);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault_AssetNotRegistered.selector, address(stray)));
+        vault.setConstituents(_constituentArray(address(wbtc), address(stray)));
+    }
+
+    function test_SetConstituents_RevertsOnDuplicate() public {
+        vm.expectRevert(abi.encodeWithSelector(IndexVault_DuplicateConstituent.selector, address(wbtc)));
+        vault.setConstituents(_constituentArray(address(wbtc), address(wbtc)));
+    }
+
+    function test_SetConstituents_ReplacesPreviousSet() public {
+        // Re-curate to WETH only; WBTC should drop out of the set entirely.
+        address[] memory one = new address[](1);
+        one[0] = address(weth);
+        vault.setConstituents(one);
+
+        assertEq(vault.constituentCount(), 1);
+        assertTrue(vault.isConstituent(address(weth)));
+        assertFalse(vault.isConstituent(address(wbtc)));
+
+        // A WBTC balance is now invisible to NAV; only WETH is valued.
+        _seedBasket(); // mints 1 WBTC + 20 WETH
+        assertEq(vault.totalAssets(), 100_000e6); // only the $100k WETH counts
+    }
+
+    function test_GetHoldings_ValuesAndWeightsSumToBasket() public {
+        _seedBasket(); // 1 WBTC ($100k) + 20 WETH ($100k), no idle
+        (IndexVault.Holding[] memory holdings, uint256 idleUsd, uint256 totalUsd) = vault.getHoldings();
+
+        assertEq(holdings.length, 2);
+        assertEq(idleUsd, 0);
+        assertEq(totalUsd, 200_000e8); // $200k in 8-decimal USD
+        assertEq(holdings[0].token, address(wbtc));
+        assertEq(holdings[0].valueUsd, 100_000e8);
+        assertEq(holdings[1].valueUsd, 100_000e8);
+        // Equal value, so 5000 bps each; weights sum to 1e4.
+        assertEq(holdings[0].weightBps, 5000);
+        assertEq(holdings[1].weightBps, 5000);
+        assertEq(holdings[0].weightBps + holdings[1].weightBps, 10_000);
+    }
+
+    function test_GetHoldings_AccountsForIdleInWeights() public {
+        _seedBasket(); // $200k basket
+        usdc.mint(address(vault), 200_000e6); // add $200k idle
+
+        (IndexVault.Holding[] memory holdings, uint256 idleUsd, uint256 totalUsd) = vault.getHoldings();
+        assertEq(idleUsd, 200_000e8);
+        assertEq(totalUsd, 400_000e8);
+        // Each constituent is now 25% of NAV; idle is the other 50%.
+        assertEq(holdings[0].weightBps, 2500);
+        assertEq(holdings[1].weightBps, 2500);
+    }
+
+    /// @notice Two index vaults share one registry but curate different sets
+    /// and keep fully independent NAV. This is the multi-index property.
+    function test_MultiIndex_TwoVaultsShareRegistryIndependently() public {
+        // Second index on the same catalog, WETH-only.
+        IndexVault vault2 = new IndexVault(IERC20(address(usdc)), registry, keeper, address(this));
+        address[] memory one = new address[](1);
+        one[0] = address(weth);
+        vault2.setConstituents(one);
+
+        // Fund each vault's basket differently.
+        _seedBasket(); // vault: 1 WBTC + 20 WETH = $200k
+        weth.mint(address(vault2), 10e18); // vault2: 10 WETH = $50k
+
+        assertEq(vault.totalAssets(), 200_000e6);
+        assertEq(vault2.totalAssets(), 50_000e6);
+
+        // Their constituent sets are independent.
+        assertEq(vault.constituentCount(), 2);
+        assertEq(vault2.constituentCount(), 1);
+        assertTrue(vault.isConstituent(address(wbtc)));
+        assertFalse(vault2.isConstituent(address(wbtc)));
     }
 }

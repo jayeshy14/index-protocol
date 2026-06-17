@@ -9,7 +9,7 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
-import { ComponentRegistry } from "src/ComponentRegistry.sol";
+import { AssetRegistry } from "src/AssetRegistry.sol";
 import { PendingSilo } from "src/PendingSilo.sol";
 import { IERC7540 } from "src/interfaces/IERC7540.sol";
 
@@ -52,6 +52,15 @@ error IndexVault_InvalidBufferBand();
 /// @notice Thrown when settlement timing parameters are inconsistent.
 error IndexVault_InvalidSettleParams();
 
+/// @notice Thrown when curating a constituent not registered in the AssetRegistry.
+error IndexVault_AssetNotRegistered(address token);
+
+/// @notice Thrown when the same token appears twice in a constituent set.
+error IndexVault_DuplicateConstituent(address token);
+
+/// @notice Thrown when a constituent set exceeds the per-index cap.
+error IndexVault_TooManyConstituents(uint256 count, uint256 cap);
+
 /**
  * @title IndexVault
  * @notice Pooled, single-asset (USDC) index vault. ERC-7540 asynchronous
@@ -66,10 +75,10 @@ error IndexVault_InvalidSettleParams();
  *   afterwards. Pending value sits in an isolated PendingSilo so it never
  *   contaminates NAV.
  *
- * NAV is oracle-based: the USD value of basket constituents (priced through
- * the ComponentRegistry's health-checked Chainlink feeds) plus the idle USDC
- * buffer, expressed in USDC units. Any stale feed makes price-sensitive
- * operations revert rather than transact on bad data.
+ * NAV is oracle-based: the USD value of this index's curated constituents
+ * (priced through the shared AssetRegistry's health-checked Chainlink feeds)
+ * plus the idle USDC buffer, expressed in USDC units. Any stale feed makes
+ * price-sensitive operations revert rather than transact on bad data.
  *
  * Pending redemptions are priced at settle time, not request time, which is
  * fairer to remaining holders.
@@ -106,14 +115,26 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
         uint256 shares;
     }
 
+    /// @dev One row of the live basket composition, returned by getHoldings.
+    struct Holding {
+        address token;
+        uint256 balance; // native token units held by the vault
+        uint256 valueUsd; // 8-decimal USD value of the holding
+        uint256 weightBps; // weight against NAV (basket plus idle) in bps
+    }
+
     // ========================================================================
     // Constants and immutables
     // ========================================================================
 
     uint256 private constant BPS = 10_000;
 
-    /// @notice Constituent price registry used for NAV.
-    ComponentRegistry public immutable REGISTRY;
+    /// @notice Shared asset catalog this index draws constituents from and prices NAV through.
+    AssetRegistry public immutable REGISTRY;
+
+    /// @notice Per-index cap on the number of constituents, distinct from the
+    /// catalog cap in the registry. Sized for the index-100 target.
+    uint256 public constant MAX_CONSTITUENTS = 100;
 
     /// @notice Isolated holder of pending and claimable value.
     PendingSilo public immutable SILO;
@@ -164,6 +185,16 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     /// @dev ERC-7540 operator approvals.
     mapping(address controller => mapping(address operator => bool)) private _operators;
 
+    /// @dev This index's curated constituent set, a subset of the registry catalog.
+    address[] private _constituents;
+
+    /// @notice Whether `token` is a constituent of this index.
+    mapping(address token => bool) public isConstituent;
+
+    /// @dev Token decimals cached at curation time, so the NAV loop needs no
+    /// external decimals call per constituent.
+    mapping(address token => uint8) private _constituentDecimals;
+
     // ========================================================================
     // Events
     // ========================================================================
@@ -182,12 +213,13 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     event KeeperSet(address indexed keeper);
     event BufferBandSet(uint16 lowBps, uint16 targetBps, uint16 highBps);
     event SettleParamsSet(uint48 minInterval, uint48 maxDelay);
+    event ConstituentsSet(address[] tokens);
 
     // ========================================================================
     // Construction
     // ========================================================================
 
-    constructor(IERC20 usdc, ComponentRegistry registry, address keeper_, address initialOwner)
+    constructor(IERC20 usdc, AssetRegistry registry, address keeper_, address initialOwner)
         ERC4626(usdc)
         ERC20("Index Vault Share", "IDXV")
         Ownable(initialOwner)
@@ -216,13 +248,14 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     function totalAssets() public view override returns (uint256) {
         uint256 usdcPrice = REGISTRY.getUsdcPriceUsd();
 
-        ComponentRegistry.Component[] memory components = REGISTRY.getComponents();
+        address[] memory cons = _constituents;
         uint256 basketUsd = 0;
-        for (uint256 i = 0; i < components.length; i++) {
-            uint256 balance = IERC20(components[i].token).balanceOf(address(this));
+        for (uint256 i = 0; i < cons.length; i++) {
+            address token = cons[i];
+            uint256 balance = IERC20(token).balanceOf(address(this));
             if (balance == 0) continue;
-            uint256 price = REGISTRY.getPriceUsd(components[i].token);
-            basketUsd += balance.mulDiv(price, 10 ** components[i].tokenDecimals, Math.Rounding.Floor);
+            uint256 price = REGISTRY.getPriceUsd(token);
+            basketUsd += balance.mulDiv(price, 10 ** _constituentDecimals[token], Math.Rounding.Floor);
         }
 
         // basketUsd has 8 decimals (registry PRICE_DECIMALS); dividing the USD
@@ -234,6 +267,85 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     /// @notice Idle USDC currently held as buffer.
     function idleAssets() public view returns (uint256) {
         return IERC20(asset()).balanceOf(address(this));
+    }
+
+    // ========================================================================
+    // Constituents (curated membership)
+    // ========================================================================
+
+    /// @notice Replaces this index's constituent set. Curated by the admin or
+    /// multisig, because category membership is a definitional choice, not a
+    /// rank. Every token must be registered in the shared AssetRegistry.
+    /// @dev Stage 1 wholesale setter under simple owner gating. The timelock,
+    /// forced-versus-discretionary removal, rate-limit, and minimum-count
+    /// guardrails are layered on later; weighting over this set stays autonomous.
+    function setConstituents(address[] calldata tokens) external onlyOwner {
+        if (tokens.length > MAX_CONSTITUENTS) revert IndexVault_TooManyConstituents(tokens.length, MAX_CONSTITUENTS);
+
+        // Clear the previous set.
+        address[] memory prev = _constituents;
+        for (uint256 i = 0; i < prev.length; i++) {
+            isConstituent[prev[i]] = false;
+            delete _constituentDecimals[prev[i]];
+        }
+        delete _constituents;
+
+        // Install the new set, validating registration and rejecting duplicates.
+        for (uint256 i = 0; i < tokens.length; i++) {
+            address token = tokens[i];
+            if (!REGISTRY.isRegistered(token)) revert IndexVault_AssetNotRegistered(token);
+            if (isConstituent[token]) revert IndexVault_DuplicateConstituent(token);
+            isConstituent[token] = true;
+            _constituentDecimals[token] = REGISTRY.getAsset(token).tokenDecimals;
+            _constituents.push(token);
+        }
+
+        emit ConstituentsSet(tokens);
+    }
+
+    /// @notice This index's current constituent set.
+    function getConstituents() external view returns (address[] memory) {
+        return _constituents;
+    }
+
+    /// @notice Number of constituents in this index.
+    function constituentCount() external view returns (uint256) {
+        return _constituents.length;
+    }
+
+    /**
+     * @notice Live basket composition: per-constituent balance, USD value, and
+     * weight against NAV, plus the idle USDC value and total NAV in USD. One
+     * call answers both what is in the index and in what proportion right now.
+     * @dev Weights are bps of total NAV (basket USD plus idle USD), 8-decimal
+     * USD throughout. Prices are health-checked, so this reverts on a stale feed.
+     */
+    function getHoldings() external view returns (Holding[] memory holdings, uint256 idleUsd, uint256 totalUsd) {
+        uint256 usdcPrice = REGISTRY.getUsdcPriceUsd();
+
+        address[] memory cons = _constituents;
+        holdings = new Holding[](cons.length);
+        uint256 basketUsd = 0;
+        for (uint256 i = 0; i < cons.length; i++) {
+            address token = cons[i];
+            uint256 balance = IERC20(token).balanceOf(address(this));
+            uint256 valueUsd = balance == 0
+                ? 0
+                : balance.mulDiv(REGISTRY.getPriceUsd(token), 10 ** _constituentDecimals[token], Math.Rounding.Floor);
+            holdings[i] = Holding({ token: token, balance: balance, valueUsd: valueUsd, weightBps: 0 });
+            basketUsd += valueUsd;
+        }
+
+        // Idle USDC (6 decimals) valued into 8-decimal USD via the USDC price.
+        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        idleUsd = idle.mulDiv(usdcPrice, _ASSET_UNIT, Math.Rounding.Floor);
+        totalUsd = basketUsd + idleUsd;
+
+        if (totalUsd > 0) {
+            for (uint256 i = 0; i < holdings.length; i++) {
+                holdings[i].weightBps = holdings[i].valueUsd.mulDiv(BPS, totalUsd, Math.Rounding.Floor);
+            }
+        }
     }
 
     // ========================================================================

@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 /**
  * @title IMethodology
  * @notice Pluggable weighting strategy, keyed by token address to match the
- * ComponentRegistry. The rebalancer treats the methodology as a black box
+ * AssetRegistry. The rebalancer treats the methodology as a black box
  * that maps a constituent set to target weights, so weighting schemes can be
  * swapped without touching vault or rebalancer code.
  */
