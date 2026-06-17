@@ -138,7 +138,7 @@ contract SupplyOracleIntegrationTest is Test {
         // Raise the cap so the 4-name index is not saturated (at 25% every
         // name pins to the cap and no supply change can move a weight); at 40%
         // the tails sit below the cap and supply flows through.
-        methodology.setWeightParams(0.4e18, 1e14);
+        methodology.setWeightParams(0.4e18, 0.4e18, 1e14);
         uint256[] memory before = methodology.getWeights(tokens);
 
         // Exclude tailA's vesting tranche (half its supply) once identified.

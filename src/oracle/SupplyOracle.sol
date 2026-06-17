@@ -274,19 +274,26 @@ contract SupplyOracle is ISupplyOracle, Ownable2Step {
             revert SupplyOracle_SourcesDiverged(token, spreadBps, divergenceToleranceBps);
         }
 
-        // Layer 3 rate-limit: clamp the move toward the median so a large jump
-        // is approached over several commits, each at least minCommitInterval
-        // apart (enforced above), rather than landing at once.
-        uint256 next = median;
+        // Round the agreed median to a coarse float-factor tier (CRSP Effective
+        // Float Factor style) so small, noisy float changes do not move target
+        // weights: a median that wiggles within a tier produces the same target,
+        // and once the committed value has converged to it no further commit
+        // moves it.
+        uint256 target = _roundFactorWad(median);
+
+        // Layer 3 rate-limit: clamp the move toward the rounded target so a
+        // large jump is approached over several commits, each at least
+        // minCommitInterval apart (enforced above), rather than landing at once.
+        uint256 next = target;
         if (prev.initialized) {
             uint256 maxStep = prev.factorWad.mulDiv(maxFactorDeltaBps, BPS, Math.Rounding.Floor);
-            if (median > prev.factorWad + maxStep) {
+            if (target > prev.factorWad + maxStep) {
                 next = prev.factorWad + maxStep;
-            } else if (median + maxStep < prev.factorWad) {
+            } else if (target + maxStep < prev.factorWad) {
                 next = prev.factorWad - maxStep;
             }
         }
-        if (next > WAD) next = WAD; // structural cap; median is already <= WAD
+        if (next > WAD) next = WAD; // structural cap; target is already <= WAD
 
         committed[token] = Committed({ factorWad: next, timestamp: uint64(block.timestamp), initialized: true });
         emit Committed_(token, next, median, count);
@@ -397,5 +404,19 @@ contract SupplyOracle is ISupplyOracle, Ownable2Step {
         uint256 mid = len / 2;
         if (len % 2 == 1) return sorted[mid];
         return (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+
+    /// @dev Rounds a free-float factor to a coarse tier, modelled on CRSP's
+    /// Effective Float Factor: nearest 5% at or above 10% float, nearest 1%
+    /// between 1% and 10%, nearest 0.1% below 1%. A nonzero factor never rounds
+    /// to zero. Coarse rounding is what suppresses needless re-weighting on
+    /// small, noisy float changes.
+    function _roundFactorWad(uint256 f) private pure returns (uint256) {
+        if (f == 0) return 0;
+        uint256 tier = f >= 1e17 ? 5e16 : (f >= 1e16 ? 1e16 : 1e15);
+        uint256 rounded = ((f + tier / 2) / tier) * tier;
+        if (rounded > WAD) rounded = WAD;
+        if (rounded == 0) rounded = tier;
+        return rounded;
     }
 }

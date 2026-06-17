@@ -55,15 +55,25 @@ contract MarketCapMethodology is IMethodology, Ownable2Step {
     /// supply arrived in native token decimals instead of whole tokens.
     uint256 public constant MARKET_CAP_SANITY_BOUND = 1e30;
 
-    /// @notice Hard per-asset weight cap in WAD. Default 25%.
-    uint256 public capWad = 0.25e18;
+    /// @notice Per-asset weight cap in WAD, the level a constituent is brought
+    /// down to when capped. The target computation always caps to this. Default 25%.
+    uint256 public capTargetWad = 0.25e18;
+
+    /// @notice Actual-weight threshold (at or above capTargetWad) past which a
+    /// capped constituent is rebalanced back to capTargetWad. The gap is
+    /// hysteresis: a held weight may drift between target and trigger without
+    /// forcing a trade, mirroring the Nasdaq-100 special rebalance (cap to 20%,
+    /// trigger at 24%). The weight computation here always caps to capTargetWad;
+    /// the rebalancer consumes capTriggerWad as the off-cycle rebalance condition.
+    /// Default 30% (a 1.2x gap over the 25% target).
+    uint256 public capTriggerWad = 0.3e18;
 
     /// @notice Minimum weight in WAD below which a constituent is pruned to
     /// zero. Default 0.01%: positions smaller than this cost more in gas and
     /// slippage at rebalance than they contribute to tracking.
     uint256 public floorWad = 1e14;
 
-    event WeightParamsSet(uint256 capWad, uint256 floorWad);
+    event WeightParamsSet(uint256 capTargetWad, uint256 capTriggerWad, uint256 floorWad);
 
     constructor(AssetRegistry registry, ISupplyOracle supplyOracle, address initialOwner) Ownable(initialOwner) {
         if (address(registry) == address(0) || address(supplyOracle) == address(0)) {
@@ -97,22 +107,28 @@ contract MarketCapMethodology is IMethodology, Ownable2Step {
         if (total == 0) revert MarketCapMethodology_InvalidTotalMarketCap();
 
         uint256[] memory weights = WeightMath.normalize(marketCaps);
-        weights = WeightMath.applyCap(weights, capWad);
-        return WeightMath.applyFloor(weights, floorWad, capWad);
+        weights = WeightMath.applyCap(weights, capTargetWad);
+        return WeightMath.applyFloor(weights, floorWad, capTargetWad);
     }
 
-    /// @notice Sets the per-asset cap and the minimum-weight floor.
+    /// @notice Sets the cap target, the cap trigger, and the minimum-weight floor.
     /// @dev Methodology-admin lever; sits behind the methodology-admin timelock.
-    /// The cap must be feasible for the constituent set: getWeights reverts
+    /// The cap target must be feasible for the constituent set: getWeights reverts
     /// with WeightMath_CapInfeasible when the number of nonzero-market-cap
-    /// constituents k satisfies k * capWad < 1e18 (a 25% cap needs at least
-    /// four viable names). Size the cap to the index, not the other way round.
-    function setWeightParams(uint256 capWad_, uint256 floorWad_) external onlyOwner {
-        if (capWad_ == 0 || capWad_ > WeightMath.WAD || floorWad_ >= capWad_) {
+    /// constituents k satisfies k * capTargetWad < 1e18 (a 25% target needs at
+    /// least four viable names). The trigger must sit at or above the target;
+    /// equal disables hysteresis (rebalance on any breach of the cap), a wider
+    /// gap gives the rebalancer a larger dead-band.
+    function setWeightParams(uint256 capTargetWad_, uint256 capTriggerWad_, uint256 floorWad_) external onlyOwner {
+        if (
+            capTargetWad_ == 0 || capTriggerWad_ > WeightMath.WAD || capTriggerWad_ < capTargetWad_
+                || floorWad_ >= capTargetWad_
+        ) {
             revert MarketCapMethodology_InvalidParams();
         }
-        capWad = capWad_;
+        capTargetWad = capTargetWad_;
+        capTriggerWad = capTriggerWad_;
         floorWad = floorWad_;
-        emit WeightParamsSet(capWad_, floorWad_);
+        emit WeightParamsSet(capTargetWad_, capTriggerWad_, floorWad_);
     }
 }
