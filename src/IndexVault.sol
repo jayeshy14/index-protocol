@@ -8,10 +8,19 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import { AssetRegistry } from "src/AssetRegistry.sol";
 import { PendingSilo } from "src/PendingSilo.sol";
 import { IERC7540 } from "src/interfaces/IERC7540.sol";
+import { IRebalancer } from "src/interfaces/IRebalancer.sol";
+import { GPv2Order } from "src/libraries/GPv2Order.sol";
+
+/// @notice The slice of GPv2Settlement the vault reads when wiring CoW.
+interface ICoWSettlement {
+    function domainSeparator() external view returns (bytes32);
+    function vaultRelayer() external view returns (address);
+}
 
 // ============================================================================
 // Errors
@@ -52,6 +61,13 @@ error IndexVault_InvalidBufferBand();
 /// @notice Thrown when settlement timing parameters are inconsistent.
 error IndexVault_InvalidSettleParams();
 
+/// @notice Thrown when a CoW order is presented before the rebalancer is wired.
+error IndexVault_RebalancerNotSet();
+
+/// @notice Thrown when the order presented to isValidSignature does not hash to
+/// the digest the settlement computed (rebinding the digest to the order).
+error IndexVault_OrderDigestMismatch(bytes32 expected, bytes32 presented);
+
 /// @notice Thrown when curating a constituent not registered in the AssetRegistry.
 error IndexVault_AssetNotRegistered(address token);
 
@@ -83,9 +99,13 @@ error IndexVault_TooManyConstituents(uint256 count, uint256 cap);
  * Pending redemptions are priced at settle time, not request time, which is
  * fairer to remaining holders.
  */
-contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
+contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using Math for uint256;
+    using GPv2Order for GPv2Order.Data;
+
+    /// @dev ERC-1271 magic value: bytes4(keccak256("isValidSignature(bytes32,bytes)")).
+    bytes4 private constant ERC1271_MAGIC = 0x1626ba7e;
 
     // ========================================================================
     // Types
@@ -162,6 +182,16 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     /// so pending requests can never be stuck on an absent keeper.
     uint48 public maxSettleDelay = 3 days;
 
+    /// @notice Rebalancer that validates CoW orders the vault signs. The vault
+    /// is the order owner and delegates order validation here.
+    address public rebalancer;
+
+    /// @notice CoW settlement domain separator, cached when the rebalancer is wired.
+    bytes32 public cowDomainSeparator;
+
+    /// @notice CoW vault relayer the vault approves to pull tokens for rebalancing.
+    address public cowRelayer;
+
     /// @notice Current open settlement epoch. Requests file into this epoch.
     uint256 public currentEpoch = 1;
 
@@ -214,6 +244,8 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     event BufferBandSet(uint16 lowBps, uint16 targetBps, uint16 highBps);
     event SettleParamsSet(uint48 minInterval, uint48 maxDelay);
     event ConstituentsSet(address[] tokens);
+    event RebalancerSet(address indexed rebalancer, address indexed settlement);
+    event RelayerApproved(address indexed token);
 
     // ========================================================================
     // Construction
@@ -425,7 +457,11 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     // ========================================================================
 
     /// @inheritdoc IERC7540
-    function requestDeposit(uint256 assets, address controller, address owner) external returns (uint256 requestId) {
+    function requestDeposit(uint256 assets, address controller, address owner)
+        external
+        nonReentrant
+        returns (uint256 requestId)
+    {
         if (assets == 0) revert IndexVault_ZeroAmount();
         if (msg.sender != owner && !isOperator(owner, msg.sender)) {
             revert IndexVault_NotAuthorized(owner, msg.sender);
@@ -454,7 +490,11 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     }
 
     /// @inheritdoc IERC7540
-    function requestRedeem(uint256 shares, address controller, address owner) external returns (uint256 requestId) {
+    function requestRedeem(uint256 shares, address controller, address owner)
+        external
+        nonReentrant
+        returns (uint256 requestId)
+    {
         if (shares == 0) revert IndexVault_ZeroAmount();
         if (msg.sender != owner && !isOperator(owner, msg.sender)) {
             _spendAllowance(owner, msg.sender, shares);
@@ -515,19 +555,32 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     // ========================================================================
 
     /// @inheritdoc IERC7540
-    function deposit(uint256 assets, address receiver, address controller) external returns (uint256 shares) {
+    function deposit(uint256 assets, address receiver, address controller)
+        external
+        nonReentrant
+        returns (uint256 shares)
+    {
         _requireAuthorized(controller);
         shares = _claimDeposit(controller, receiver, assets);
     }
 
     /// @inheritdoc IERC7540
-    function mint(uint256 shares, address receiver, address controller) external returns (uint256 assets) {
+    function mint(uint256 shares, address receiver, address controller) external nonReentrant returns (uint256 assets) {
         _requireAuthorized(controller);
         DepositRequestState storage request = _depositRequests[controller];
         EpochData storage epoch = _epochs[request.epochId];
         if (!epoch.settled) revert IndexVault_RequestNotSettled();
+
+        // Debit the assets backing exactly `shares` (rounded up, so the caller
+        // pays the ceil) and transfer exactly `shares`. Going through
+        // _claimDeposit would ceil to assets then floor back to shares, leaving
+        // the caller a wei of shares short; this delivers the amount requested.
+        // The assets bound is at or below request.assets, so no over-claim.
         assets = shares.mulDiv(epoch.pendingDepositAssets, epoch.depositSharesMinted, Math.Rounding.Ceil);
-        _claimDeposit(controller, receiver, assets);
+        if (assets > request.assets) revert IndexVault_ExceedsClaimable(assets, request.assets);
+        request.assets -= assets;
+        _transfer(address(SILO), receiver, shares);
+        emit DepositClaimed(controller, receiver, assets, shares);
     }
 
     /**
@@ -589,7 +642,7 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
      * settlement, callable by anyone as a liveness backstop. Must be at least
      * one block after the most recent request (flash-loan protection).
      */
-    function settle() external {
+    function settle() external nonReentrant {
         if (msg.sender != keeper) {
             if (block.timestamp < lastSettleTimestamp + maxSettleDelay) revert IndexVault_NotKeeper(msg.sender);
         }
@@ -613,7 +666,6 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
             redeemShares == 0 ? 0 : redeemShares.mulDiv(ta + 1, supply + virtualShares, Math.Rounding.Floor);
 
         uint256 idle = idleAssets();
-        if (assetsToPay > idle) revert IndexVault_InsufficientSettlementLiquidity(assetsToPay, idle);
 
         epoch.settled = true;
         epoch.depositSharesMinted = sharesToMint;
@@ -621,13 +673,22 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
         currentEpoch = epochId + 1;
         lastSettleTimestamp = block.timestamp;
 
-        if (redeemShares > 0) {
-            _burn(address(SILO), redeemShares);
-            IERC20(asset()).safeTransfer(address(SILO), assetsToPay);
-        }
+        // Settle the deposit leg first: pull the epoch's pending deposit USDC
+        // into the buffer and mint its shares. This nets the two sides, so a
+        // balanced epoch's deposit inflow can fund its redemption outflow,
+        // rather than the redemption check seeing only the prior buffer and
+        // deadlocking an epoch that is busy on both sides.
         if (depositAssets > 0) {
             IERC20(asset()).safeTransferFrom(address(SILO), address(this), depositAssets);
             _mint(address(SILO), sharesToMint);
+        }
+
+        // Redemption leg against the topped-up buffer.
+        if (redeemShares > 0) {
+            uint256 available = idle + depositAssets;
+            if (assetsToPay > available) revert IndexVault_InsufficientSettlementLiquidity(assetsToPay, available);
+            _burn(address(SILO), redeemShares);
+            IERC20(asset()).safeTransfer(address(SILO), assetsToPay);
         }
 
         emit Settled(epochId, ta, supply, depositAssets, sharesToMint, redeemShares, assetsToPay);
@@ -665,6 +726,48 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     }
 
     // ========================================================================
+    // CoW rebalancing (the vault is the order owner)
+    // ========================================================================
+
+    /// @notice Wires the rebalancer and caches the CoW settlement's domain
+    /// separator and relayer, so the vault can validate orders and approve the
+    /// relayer to pull tokens for rebalancing.
+    function setRebalancer(address rebalancer_, address settlement) external onlyOwner {
+        if (rebalancer_ == address(0) || settlement == address(0)) revert IndexVault_ZeroAddress();
+        rebalancer = rebalancer_;
+        cowDomainSeparator = ICoWSettlement(settlement).domainSeparator();
+        cowRelayer = ICoWSettlement(settlement).vaultRelayer();
+        emit RebalancerSet(rebalancer_, settlement);
+    }
+
+    /// @notice Approves the CoW relayer to pull `token` from the vault. Needed
+    /// for each constituent (to sell) and for USDC (to buy). Owner-gated; the
+    /// trades it enables are bounded by the rebalancer's order validation and
+    /// the per-order minimum-out.
+    function approveRelayer(address token) external onlyOwner {
+        if (cowRelayer == address(0)) revert IndexVault_RebalancerNotSet();
+        IERC20(token).forceApprove(cowRelayer, type(uint256).max);
+        emit RelayerApproved(token);
+    }
+
+    /// @notice ERC-1271 validation so the CoW settlement accepts the vault's
+    /// orders without a pre-signature. The digest is rebound to the decoded
+    /// order, then the rebalancer decides whether the order is a legitimate
+    /// rebalance leg right now.
+    /// @param digest The order digest the settlement computed.
+    /// @param signature The ABI-encoded GPv2Order for that trade.
+    function isValidSignature(bytes32 digest, bytes calldata signature) external view returns (bytes4) {
+        if (rebalancer == address(0)) revert IndexVault_RebalancerNotSet();
+
+        GPv2Order.Data memory order = abi.decode(signature, (GPv2Order.Data));
+        bytes32 expected = order.hash(cowDomainSeparator);
+        if (expected != digest) revert IndexVault_OrderDigestMismatch(expected, digest);
+
+        IRebalancer(rebalancer).validateOrder(order);
+        return ERC1271_MAGIC;
+    }
+
+    // ========================================================================
     // ERC-4626 internals
     // ========================================================================
 
@@ -672,5 +775,24 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540 {
     /// share offset also blunts first-depositor share-price inflation.
     function _decimalsOffset() internal pure override returns (uint8) {
         return 12;
+    }
+
+    /// @dev Reentrancy guard on the synchronous lane. Every ERC-4626 sync flow
+    /// (deposit, mint, withdraw, redeem) funnels through these two hooks, so
+    /// guarding them here covers the whole sync path. The async request, claim,
+    /// and settle entry points carry their own guards and bypass these hooks, so
+    /// there is no nested-guard reversion. Defense in depth: NAV reads a
+    /// constituent's balanceOf, so a callback token could otherwise reenter, and
+    /// the curation policy independently excludes callback tokens.
+    function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override nonReentrant {
+        super._deposit(caller, receiver, assets, shares);
+    }
+
+    function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares)
+        internal
+        override
+        nonReentrant
+    {
+        super._withdraw(caller, receiver, owner, assets, shares);
     }
 }

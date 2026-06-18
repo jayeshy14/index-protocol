@@ -152,22 +152,29 @@ library WeightMath {
 
         uint256 deficit = WAD - sum;
         for (uint256 round = 0; round < n && deficit > 0; round++) {
-            // Find the nonzero constituent with the most headroom below the
-            // cap. Zero-weight entries are skipped so dust can never
-            // resurrect a constituent the floor pruned.
+            // Carry the dust to the largest-weight constituent that still has
+            // headroom below the cap. Placing it on the top names rather than
+            // the most-headroom (smallest) names keeps the dust from inverting
+            // the tail ordering, since the redistribution above already
+            // preserves order. The tie-break is strict (`>`), so among equal
+            // maxima the earliest (highest-ranked) name wins: lifting the lower-
+            // ranked one would push it above its equal-weight, higher-ranked
+            // sibling and invert the order by exactly the dust size. Zero-weight
+            // entries are skipped so dust can never resurrect a constituent the
+            // floor pruned.
             uint256 bestIdx = type(uint256).max;
-            uint256 bestHeadroom = 0;
+            uint256 bestWeight = 0;
             for (uint256 i = 0; i < n; i++) {
-                if (weights[i] == 0) continue;
-                uint256 headroom = cap - weights[i];
-                if (headroom > bestHeadroom) {
-                    bestHeadroom = headroom;
+                if (weights[i] == 0 || weights[i] >= cap) continue;
+                if (weights[i] > bestWeight) {
+                    bestWeight = weights[i];
                     bestIdx = i;
                 }
             }
             if (bestIdx == type(uint256).max) revert WeightMath_DustPlacementFailed();
 
-            uint256 add = deficit < bestHeadroom ? deficit : bestHeadroom;
+            uint256 headroom = cap - weights[bestIdx];
+            uint256 add = deficit < headroom ? deficit : headroom;
             weights[bestIdx] += add;
             deficit -= add;
         }
