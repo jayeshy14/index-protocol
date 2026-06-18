@@ -393,6 +393,48 @@ contract IndexVaultTest is Test {
         assertEq(vault.currentEpoch(), 3);
     }
 
+    /// @notice A balanced epoch (large deposit and large redemption together)
+    /// settles by netting: the deposit inflow funds the redemption outflow, even
+    /// though the prior idle buffer alone could not cover it. Regression for the
+    /// settle-ordering deadlock.
+    function test_Settle_NetsDepositsAgainstRedemptions() public {
+        // Establish supply: alice deposits $300k async and claims.
+        vm.prank(alice);
+        vault.requestDeposit(300_000e6, alice, alice);
+        _settle();
+        vm.prank(alice);
+        uint256 aliceShares = vault.deposit(300_000e6, alice, alice);
+
+        // Simulate a rebalance having deployed ~$290k of idle into the basket,
+        // leaving only $10k idle. NAV is unchanged at $300k, so NAV per share
+        // holds, but the buffer is now small relative to share value.
+        deal(address(usdc), address(vault), 10_000e6);
+        wbtc.mint(address(vault), 2.9e8); // +$290k basket (WBTC at $100k)
+        assertEq(vault.totalAssets(), 300_000e6);
+
+        // Balanced epoch: bob deposits $100k, alice redeems ~30% (~$90k). The
+        // $10k buffer cannot cover the redemption, but the deposit inflow can.
+        uint256 redeemShares = aliceShares * 30 / 100;
+        vm.prank(bob);
+        vault.requestDeposit(100_000e6, bob, bob);
+        vm.prank(alice);
+        vault.requestRedeem(redeemShares, alice, alice);
+
+        // Pre-fix this reverted on the liquidity check; now it settles.
+        _settle();
+        assertEq(vault.currentEpoch(), 3);
+
+        // Both sides claim.
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        uint256 paid = vault.redeem(redeemShares, alice, alice);
+        assertApproxEqRel(paid, 90_000e6, 0.01e18);
+        assertEq(usdc.balanceOf(alice) - aliceBefore, paid);
+
+        vm.prank(bob);
+        assertGt(vault.deposit(100_000e6, bob, bob), 0);
+    }
+
     function test_Settle_RevertsOnStaleFeed() public {
         _seedBasket();
         vm.prank(alice);
