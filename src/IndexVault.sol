@@ -77,6 +77,21 @@ error IndexVault_DuplicateConstituent(address token);
 /// @notice Thrown when a constituent set exceeds the per-index cap.
 error IndexVault_TooManyConstituents(uint256 count, uint256 cap);
 
+/// @notice Thrown when a governor-gated function is called by another address.
+error IndexVault_NotGovernor(address caller);
+
+/// @notice Thrown when seeding constituents after governance has been wired.
+error IndexVault_GovernorAlreadySet();
+
+/// @notice Thrown when a membership change targets a non-constituent.
+error IndexVault_NotConstituent(address token);
+
+/// @notice Thrown when finalizing removal of a constituent not marked for wind-down.
+error IndexVault_NotWindingDown(address token);
+
+/// @notice Thrown when finalizing removal before the position has been wound down to dust.
+error IndexVault_PositionNotDust(address token, uint256 valueUsd);
+
 /**
  * @title IndexVault
  * @notice Pooled, single-asset (USDC) index vault. ERC-7540 asynchronous
@@ -225,6 +240,21 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     /// external decimals call per constituent.
     mapping(address token => uint8) private _constituentDecimals;
 
+    /// @notice Membership governor. Once set, constituent changes flow through
+    /// its timelocked, bounded lifecycle and `setConstituents` is locked to its
+    /// pre-governance seeding role. Zero means governance is not yet wired.
+    address public governor;
+
+    /// @notice Whether `token` is marked for wind-down. A winding-down
+    /// constituent stays in the set and in NAV while the rebalancer exits its
+    /// position to USDC at the oracle-anchored minimum-out, so it is sold rather
+    /// than dropped. It is deleted only once the position is dust.
+    mapping(address token => bool) public windingDown;
+
+    /// @notice Position USD value (8-decimal, matching NAV) below which a
+    /// winding-down constituent is considered fully exited and may be removed.
+    uint256 public dustThresholdUsd = 1e8;
+
     // ========================================================================
     // Events
     // ========================================================================
@@ -246,6 +276,11 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     event ConstituentsSet(address[] tokens);
     event RebalancerSet(address indexed rebalancer, address indexed settlement);
     event RelayerApproved(address indexed token);
+    event GovernorSet(address indexed governor);
+    event ConstituentAdded(address indexed token);
+    event WindDownBegun(address indexed token);
+    event ConstituentRemoved(address indexed token);
+    event DustThresholdSet(uint256 dustThresholdUsd);
 
     // ========================================================================
     // Construction
@@ -305,13 +340,16 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     // Constituents (curated membership)
     // ========================================================================
 
-    /// @notice Replaces this index's constituent set. Curated by the admin or
-    /// multisig, because category membership is a definitional choice, not a
-    /// rank. Every token must be registered in the shared AssetRegistry.
-    /// @dev Stage 1 wholesale setter under simple owner gating. The timelock,
-    /// forced-versus-discretionary removal, rate-limit, and minimum-count
-    /// guardrails are layered on later; weighting over this set stays autonomous.
+    /// @notice Seeds this index's constituent set before governance is wired.
+    /// Curated by the admin or multisig, because category membership is a
+    /// definitional choice, not a rank. Every token must be registered in the
+    /// shared AssetRegistry.
+    /// @dev Pre-governance seeding only: once a `governor` is set, this reverts
+    /// and every membership change must flow through the governor's timelocked,
+    /// bounded lifecycle (forced-versus-discretionary removal, rate-limit,
+    /// minimum-count, wind-down). Weighting over this set stays autonomous.
     function setConstituents(address[] calldata tokens) external onlyOwner {
+        if (governor != address(0)) revert IndexVault_GovernorAlreadySet();
         if (tokens.length > MAX_CONSTITUENTS) revert IndexVault_TooManyConstituents(tokens.length, MAX_CONSTITUENTS);
 
         // Clear the previous set.
@@ -333,6 +371,79 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
         }
 
         emit ConstituentsSet(tokens);
+    }
+
+    /// @dev Restricts membership mutation to the governor, which enforces the
+    /// timelocked, bounded change lifecycle (Section 16). The vault holds the
+    /// set and applies changes; the governor owns the policy.
+    modifier onlyGovernor() {
+        if (msg.sender != governor) revert IndexVault_NotGovernor(msg.sender);
+        _;
+    }
+
+    /// @notice Adds a single registered token to the constituent set. The
+    /// governor has already checked the addition bounds (size floor, rate limit).
+    function governorAddConstituent(address token) external onlyGovernor {
+        if (_constituents.length >= MAX_CONSTITUENTS) {
+            revert IndexVault_TooManyConstituents(_constituents.length + 1, MAX_CONSTITUENTS);
+        }
+        if (!REGISTRY.isRegistered(token)) revert IndexVault_AssetNotRegistered(token);
+        if (isConstituent[token]) revert IndexVault_DuplicateConstituent(token);
+
+        isConstituent[token] = true;
+        _constituentDecimals[token] = REGISTRY.getAsset(token).tokenDecimals;
+        _constituents.push(token);
+        emit ConstituentAdded(token);
+    }
+
+    /// @notice Marks a constituent for wind-down. It stays in the set and in NAV
+    /// so its value is never orphaned; the rebalancer zeroes its target and sells
+    /// the position to USDC at the oracle-anchored minimum-out. This is the
+    /// "wind-down, not dump" execution path (Section 16.5).
+    function governorBeginWindDown(address token) external onlyGovernor {
+        if (!isConstituent[token]) revert IndexVault_NotConstituent(token);
+        windingDown[token] = true;
+        emit WindDownBegun(token);
+    }
+
+    /// @notice Deletes a winding-down constituent once its position is dust, so
+    /// removal only ever drops a position the vault no longer meaningfully holds.
+    /// @dev Reverts while the position still has material value, which also means
+    /// a constituent whose feed is dead cannot be finalized here (it cannot be
+    /// priced or wound down): that is the quarantine case deferred to Section 4.
+    function governorFinalizeRemoval(address token) external onlyGovernor {
+        if (!windingDown[token]) revert IndexVault_NotWindingDown(token);
+
+        uint256 valueUsd = _positionValueUsd(token);
+        if (valueUsd > dustThresholdUsd) revert IndexVault_PositionNotDust(token, valueUsd);
+
+        _removeConstituent(token);
+        windingDown[token] = false;
+        emit ConstituentRemoved(token);
+    }
+
+    /// @dev Swap-and-pop removal of `token` from the constituent set, clearing
+    /// its membership and cached decimals.
+    function _removeConstituent(address token) private {
+        uint256 len = _constituents.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (_constituents[i] == token) {
+                _constituents[i] = _constituents[len - 1];
+                _constituents.pop();
+                break;
+            }
+        }
+        isConstituent[token] = false;
+        delete _constituentDecimals[token];
+    }
+
+    /// @dev USD value (8-decimal, matching the NAV term) of the vault's current
+    /// balance of `token`. Reverts on a stale feed, exactly as NAV does.
+    function _positionValueUsd(address token) private view returns (uint256) {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        if (balance == 0) return 0;
+        uint256 price = REGISTRY.getPriceUsd(token);
+        return balance.mulDiv(price, 10 ** _constituentDecimals[token], Math.Rounding.Floor);
     }
 
     /// @notice This index's current constituent set.
@@ -703,6 +814,23 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
         if (keeper_ == address(0)) revert IndexVault_ZeroAddress();
         keeper = keeper_;
         emit KeeperSet(keeper_);
+    }
+
+    /// @notice Wires the membership governor. Once set, `setConstituents` is
+    /// locked and every membership change flows through the governor's
+    /// timelocked, bounded lifecycle. Owner-gated, since in production the owner
+    /// is itself a governance multisig or timelock.
+    function setGovernor(address governor_) external onlyOwner {
+        if (governor_ == address(0)) revert IndexVault_ZeroAddress();
+        governor = governor_;
+        emit GovernorSet(governor_);
+    }
+
+    /// @notice Sets the dust value below which a wound-down position may be
+    /// removed from the set.
+    function setDustThreshold(uint256 dustThresholdUsd_) external onlyOwner {
+        dustThresholdUsd = dustThresholdUsd_;
+        emit DustThresholdSet(dustThresholdUsd_);
     }
 
     /// @notice Sets the buffer band. Low and high gate the sync lanes; target
