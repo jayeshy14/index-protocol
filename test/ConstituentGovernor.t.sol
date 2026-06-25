@@ -16,12 +16,11 @@ import {
     ConstituentGovernor_BelowMinSize,
     ConstituentGovernor_BelowMinCount,
     ConstituentGovernor_RateLimited,
-    ConstituentGovernor_TimelockNotElapsed,
-    ConstituentGovernor_NoProposal,
     ConstituentGovernor_AlreadyConstituent,
     ConstituentGovernor_NotConstituent,
     ConstituentGovernor_NotGuardianOrOwner
 } from "src/governance/ConstituentGovernor.sol";
+import { Timelock_NotElapsed, Timelock_NotScheduled } from "src/governance/TimelockedProposals.sol";
 import { MockERC20 } from "test/mocks/MockERC20.sol";
 import { MockAggregator } from "test/mocks/MockAggregator.sol";
 import { MockSupplyOracle } from "test/mocks/MockSupplyOracle.sol";
@@ -173,7 +172,7 @@ contract ConstituentGovernorTest is Test {
         vm.warp(block.timestamp + ADD_DELAY - 1);
         vm.expectRevert(
             abi.encodeWithSelector(
-                ConstituentGovernor_TimelockNotElapsed.selector,
+                Timelock_NotElapsed.selector,
                 governor.proposalId(address(uni), ConstituentGovernor.ChangeKind.Add),
                 block.timestamp + 1
             )
@@ -252,7 +251,7 @@ contract ConstituentGovernorTest is Test {
         governor.cancelProposal(address(link), ConstituentGovernor.ChangeKind.DiscretionaryRemove);
         vm.warp(block.timestamp + DISC_DELAY);
         bytes32 id = governor.proposalId(address(link), ConstituentGovernor.ChangeKind.DiscretionaryRemove);
-        vm.expectRevert(abi.encodeWithSelector(ConstituentGovernor_NoProposal.selector, id));
+        vm.expectRevert(abi.encodeWithSelector(Timelock_NotScheduled.selector, id));
         governor.executeDiscretionaryRemove(address(link));
     }
 

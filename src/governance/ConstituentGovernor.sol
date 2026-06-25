@@ -8,6 +8,7 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { IndexVault } from "src/IndexVault.sol";
 import { AssetRegistry } from "src/AssetRegistry.sol";
 import { ISupplyOracle } from "src/interfaces/ISupplyOracle.sol";
+import { TimelockedProposals } from "src/governance/TimelockedProposals.sol";
 
 // ============================================================================
 // Errors
@@ -17,9 +18,6 @@ error ConstituentGovernor_ZeroAddress();
 error ConstituentGovernor_NotRegistered(address token);
 error ConstituentGovernor_AlreadyConstituent(address token);
 error ConstituentGovernor_NotConstituent(address token);
-error ConstituentGovernor_ProposalExists(bytes32 id);
-error ConstituentGovernor_NoProposal(bytes32 id);
-error ConstituentGovernor_TimelockNotElapsed(bytes32 id, uint256 eta);
 error ConstituentGovernor_AssetHealthy(address token);
 error ConstituentGovernor_BelowMinSize(address token, uint256 marketCapUsd, uint256 floorUsd);
 error ConstituentGovernor_BelowMinCount(uint256 resulting, uint256 minimum);
@@ -58,7 +56,7 @@ error ConstituentGovernor_InvalidParams();
  *   the one your oracle cannot price) is the quarantine path deferred to
  *   Section 4; such a forced-removed asset sits marked for wind-down until then.
  */
-contract ConstituentGovernor is Ownable2Step {
+contract ConstituentGovernor is Ownable2Step, TimelockedProposals {
     using Math for uint256;
 
     /// @dev Price feeds are 8-decimal, so a whole-token supply times an
@@ -70,12 +68,6 @@ contract ConstituentGovernor is Ownable2Step {
         Add,
         ForcedRemove,
         DiscretionaryRemove
-    }
-
-    struct Proposal {
-        uint64 eta;
-        ChangeKind kind;
-        bool exists;
     }
 
     // --- Delay bounds ---
@@ -119,9 +111,7 @@ contract ConstituentGovernor is Ownable2Step {
     uint64 public windowStart;
     uint256 public changesInWindow;
 
-    // --- Proposal storage ---
-
-    mapping(bytes32 id => Proposal) public proposals;
+    // Proposal scheduling (eta store) lives in TimelockedProposals.
 
     // ========================================================================
     // Events
@@ -220,8 +210,7 @@ contract ConstituentGovernor is Ownable2Step {
             revert ConstituentGovernor_NotGuardianOrOwner(msg.sender);
         }
         bytes32 id = proposalId(token, kind);
-        if (!proposals[id].exists) revert ConstituentGovernor_NoProposal(id);
-        delete proposals[id];
+        _cancel(id);
         emit ProposalCancelled(id, token, kind);
     }
 
@@ -303,18 +292,12 @@ contract ConstituentGovernor is Ownable2Step {
         returns (bytes32 id)
     {
         id = proposalId(token, kind);
-        if (proposals[id].exists) revert ConstituentGovernor_ProposalExists(id);
-        uint64 eta = uint64(block.timestamp + delay);
-        proposals[id] = Proposal({ eta: eta, kind: kind, exists: true });
+        uint64 eta = _schedule(id, delay);
         emit ProposalCreated(id, token, kind, eta, justification);
     }
 
     function _consumeProposal(address token, ChangeKind kind) private {
-        bytes32 id = proposalId(token, kind);
-        Proposal memory p = proposals[id];
-        if (!p.exists) revert ConstituentGovernor_NoProposal(id);
-        if (block.timestamp < p.eta) revert ConstituentGovernor_TimelockNotElapsed(id, p.eta);
-        delete proposals[id];
+        _consume(proposalId(token, kind));
     }
 
     /// @dev Both removal paths share the rate limit and the wind-down begin. The
