@@ -5,6 +5,7 @@ import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IERC20Metadata } from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import { TimelockedProposals } from "src/governance/TimelockedProposals.sol";
 
 // ============================================================================
 // Errors
@@ -12,15 +13,6 @@ import { IERC20Metadata } from "@openzeppelin/contracts/token/ERC20/extensions/I
 
 /// @notice Thrown when a constructor or setter receives the zero address.
 error ExcludedRegistry_ZeroAddress();
-
-/// @notice Thrown when proposing a change that is already pending.
-error ExcludedRegistry_ChangeAlreadyPending(bytes32 id);
-
-/// @notice Thrown when executing or cancelling a change that was never proposed.
-error ExcludedRegistry_NoPendingChange(bytes32 id);
-
-/// @notice Thrown when executing a change before its timelock has elapsed.
-error ExcludedRegistry_TimelockNotElapsed(bytes32 id, uint256 eta);
 
 /// @notice Thrown when a proposed change is redundant (excluding an address
 /// already excluded, or including one not currently excluded).
@@ -49,13 +41,7 @@ error ExcludedRegistry_InvalidDelay(uint256 delay);
  * full delay before it can take effect, so a malicious or mistaken edit can
  * be seen and contested before it moves any weight.
  */
-contract ExcludedAddressRegistry is Ownable2Step {
-    struct PendingChange {
-        uint64 eta;
-        bool exclude; // true: add to excluded set; false: remove
-        bool exists;
-    }
-
+contract ExcludedAddressRegistry is Ownable2Step, TimelockedProposals {
     uint256 public constant MIN_DELAY = 1 hours;
     uint256 public constant MAX_DELAY = 30 days;
 
@@ -68,8 +54,8 @@ contract ExcludedAddressRegistry is Ownable2Step {
     /// @notice Whether `account` is currently excluded for `token`.
     mapping(address token => mapping(address account => bool)) public isExcluded;
 
-    /// @dev Pending changes keyed by changeId(token, account, exclude).
-    mapping(bytes32 id => PendingChange) public pendingChanges;
+    // Pending-change scheduling (eta store) lives in TimelockedProposals,
+    // keyed by changeId(token, account, exclude).
 
     event DelaySet(uint256 delay);
     event ChangeProposed(bytes32 indexed id, address indexed token, address indexed account, bool exclude, uint256 eta);
@@ -99,10 +85,7 @@ contract ExcludedAddressRegistry is Ownable2Step {
         if (isExcluded[token][account] == exclude) revert ExcludedRegistry_NoOp(token, account, exclude);
 
         id = changeId(token, account, exclude);
-        if (pendingChanges[id].exists) revert ExcludedRegistry_ChangeAlreadyPending(id);
-
-        uint64 eta = uint64(block.timestamp + delay);
-        pendingChanges[id] = PendingChange({ eta: eta, exclude: exclude, exists: true });
+        uint64 eta = _schedule(id, delay);
         emit ChangeProposed(id, token, account, exclude, eta);
     }
 
@@ -110,8 +93,7 @@ contract ExcludedAddressRegistry is Ownable2Step {
     /// the guardian once fast pause powers are wired in.
     function cancelChange(address token, address account, bool exclude) external onlyOwner {
         bytes32 id = changeId(token, account, exclude);
-        if (!pendingChanges[id].exists) revert ExcludedRegistry_NoPendingChange(id);
-        delete pendingChanges[id];
+        _cancel(id);
         emit ChangeCancelled(id, token, account, exclude);
     }
 
@@ -120,11 +102,7 @@ contract ExcludedAddressRegistry is Ownable2Step {
     /// can finalize a change the owner has already publicly committed to.
     function executeChange(address token, address account, bool exclude) external {
         bytes32 id = changeId(token, account, exclude);
-        PendingChange memory change = pendingChanges[id];
-        if (!change.exists) revert ExcludedRegistry_NoPendingChange(id);
-        if (block.timestamp < change.eta) revert ExcludedRegistry_TimelockNotElapsed(id, change.eta);
-
-        delete pendingChanges[id];
+        _consume(id);
 
         if (exclude) {
             // Guard against a redundant add that slipped in between propose and
