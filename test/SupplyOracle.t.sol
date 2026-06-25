@@ -4,12 +4,12 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 
 import { ExcludedAddressRegistry } from "src/oracle/ExcludedAddressRegistry.sol";
+import { ExcludedRegistry_NoOp } from "src/oracle/ExcludedAddressRegistry.sol";
 import {
-    ExcludedRegistry_TimelockNotElapsed,
-    ExcludedRegistry_NoPendingChange,
-    ExcludedRegistry_ChangeAlreadyPending,
-    ExcludedRegistry_NoOp
-} from "src/oracle/ExcludedAddressRegistry.sol";
+    Timelock_NotElapsed,
+    Timelock_NotScheduled,
+    Timelock_AlreadyScheduled
+} from "src/governance/TimelockedProposals.sol";
 import { SupplyOracle } from "src/oracle/SupplyOracle.sol";
 import {
     SupplyOracle_Paused,
@@ -104,9 +104,9 @@ contract SupplyOracleTest is Test {
     function test_Timelock_CannotExecuteEarly() public {
         registry.proposeChange(address(token), treasury, true);
         bytes32 id = registry.changeId(address(token), treasury, true);
-        (uint64 eta,,) = registry.pendingChanges(id);
+        uint64 eta = registry.proposalEta(id);
 
-        vm.expectRevert(abi.encodeWithSelector(ExcludedRegistry_TimelockNotElapsed.selector, id, eta));
+        vm.expectRevert(abi.encodeWithSelector(Timelock_NotElapsed.selector, id, eta));
         registry.executeChange(address(token), treasury, true);
 
         vm.warp(eta);
@@ -129,14 +129,14 @@ contract SupplyOracleTest is Test {
         bytes32 id = registry.changeId(address(token), treasury, true);
 
         vm.warp(block.timestamp + DELAY);
-        vm.expectRevert(abi.encodeWithSelector(ExcludedRegistry_NoPendingChange.selector, id));
+        vm.expectRevert(abi.encodeWithSelector(Timelock_NotScheduled.selector, id));
         registry.executeChange(address(token), treasury, true);
     }
 
     function test_Timelock_RejectsRedundantAndDuplicate() public {
         registry.proposeChange(address(token), treasury, true);
         bytes32 id = registry.changeId(address(token), treasury, true);
-        vm.expectRevert(abi.encodeWithSelector(ExcludedRegistry_ChangeAlreadyPending.selector, id));
+        vm.expectRevert(abi.encodeWithSelector(Timelock_AlreadyScheduled.selector, id));
         registry.proposeChange(address(token), treasury, true);
 
         vm.warp(block.timestamp + DELAY);
