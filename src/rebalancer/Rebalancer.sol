@@ -195,7 +195,11 @@ contract Rebalancer {
 
         for (uint256 i = 0; i < constituents.length; i++) {
             address token = constituents[i];
-            targetUsd[token] = navUsd.mulDiv(weights[i], WAD, Math.Rounding.Floor);
+            // A constituent marked for wind-down targets zero, so the whole
+            // position becomes overweight and is sold to USDC at the
+            // oracle-anchored minimum-out (Section 16.5, wind-down not dump).
+            uint256 target = VAULT.windingDown(token) ? 0 : navUsd.mulDiv(weights[i], WAD, Math.Rounding.Floor);
+            targetUsd[token] = target;
             inEpoch[token] = true;
             _epochConstituents.push(token);
         }
@@ -226,7 +230,9 @@ contract Rebalancer {
         if (navUsd == 0) return 0;
 
         for (uint256 i = 0; i < cons.length; i++) {
-            uint256 targetBps = weights[i].mulDiv(BPS, WAD, Math.Rounding.Floor);
+            // A winding-down constituent targets zero, so its full held weight
+            // reads as drift and pulls the index toward opening an exit epoch.
+            uint256 targetBps = VAULT.windingDown(cons[i]) ? 0 : weights[i].mulDiv(BPS, WAD, Math.Rounding.Floor);
             uint256 actualBps = holdings[i].weightBps;
             uint256 d = actualBps > targetBps ? actualBps - targetBps : targetBps - actualBps;
             if (d > maxBps) maxBps = d;
