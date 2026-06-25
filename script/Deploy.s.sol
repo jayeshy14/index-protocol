@@ -13,6 +13,8 @@ import { SupplyOracle } from "src/oracle/SupplyOracle.sol";
 import { ISupplyOracle } from "src/interfaces/ISupplyOracle.sol";
 import { IMethodology } from "src/interfaces/IMethodology.sol";
 import { Rebalancer } from "src/rebalancer/Rebalancer.sol";
+import { ConstituentGovernor } from "src/governance/ConstituentGovernor.sol";
+import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
 
 /**
  * @title Deploy
@@ -20,19 +22,33 @@ import { Rebalancer } from "src/rebalancer/Rebalancer.sol";
  * oracle stack, the asset registry, the market-cap methodology, the async
  * vault, and the CoW rebalancer.
  *
- * The deployer is the temporary owner of every Ownable contract so it can do
- * the owner-gated wiring (feed registration, constituents, weight params,
- * oracle params, rebalancer wiring, relayer approvals) inside the broadcast.
- * Ownership is then transferred to OWNER (a multisig in production); the
- * keeper, guardian, and reporter roles are set to their final holders directly.
+ * The deployer is the temporary owner of every contract that needs owner-gated
+ * wiring (feed registration, constituents, weight params, oracle params,
+ * rebalancer wiring, relayer approvals) inside the broadcast. Afterwards every
+ * such contract is handed to a single top-level OWNER (a multisig in
+ * production), so there is one governance authority over the whole system.
+ * Every contract is Ownable2Step, so OWNER must call acceptOwnership() on each
+ * to complete the handoff. The ConstituentGovernor needs no deploy-time owner
+ * calls, so it is owned by OWNER from construction.
+ *
+ * The MarketCapMethodology is the exception: its only privileged power is
+ * setWeightParams, which moves every weight, so it is owned by a dedicated
+ * TimelockController (proposer and executor = OWNER) rather than OWNER directly.
+ * A weight-param change is therefore a delayed, publicly visible operation the
+ * multisig schedules through the timelock, while operational knobs on the other
+ * contracts stay on the fast multisig path.
+ *
+ * GUARDIAN is the single guardian for both the supply oracle (pause) and the
+ * constituent governor (veto). KEEPER and REPORTER are operational roles set to
+ * their final holders directly.
  *
  * Required env:
  *   PRIVATE_KEY   deployer key (also the transient owner during wiring)
  *
  * Optional env (default to the deployer / mainnet canonical addresses):
- *   OWNER         final owner / governance multisig            (default: deployer)
+ *   OWNER         single top-level owner / governance multisig  (default: deployer)
  *   KEEPER        settlement + scheduled-rebalance keeper       (default: deployer)
- *   GUARDIAN      supply-oracle pause guardian                  (default: deployer)
+ *   GUARDIAN      supply-oracle pause + governor veto guardian  (default: deployer)
  *   REPORTER      initial free-float factor reporter            (default: deployer)
  *   USDC          base asset                                    (default: mainnet USDC)
  *   SETTLEMENT    GPv2Settlement                                (default: mainnet GPv2)
@@ -61,11 +77,13 @@ contract Deploy is Script {
     uint48 internal constant USDC_HEARTBEAT = 1 days; // USDC/USD ticks slowly
     uint48 internal constant ASSET_HEARTBEAT = 1 hours; // BTC/USD, ETH/USD
 
-    // --- Methodology params (WAD) -----------------------------------------
+    // --- Methodology -----------------------------------------------------
 
-    uint256 internal constant CAP_TARGET_WAD = 0.25e18; // cap to 25%
-    uint256 internal constant CAP_TRIGGER_WAD = 0.3e18; // recap only above 30% actual
-    uint256 internal constant FLOOR_WAD = 1e14; // prune sub-1bp dust positions
+    // The methodology ships with sensible weight-param defaults (25% cap
+    // target, 30% cap trigger, 1bp floor). It is owned by a TimelockController,
+    // so changing those params is a delayed, publicly visible operation the
+    // multisig schedules through the timelock rather than a silent setter call.
+    uint256 internal constant WEIGHT_PARAMS_TIMELOCK_DELAY = 2 days;
 
     // --- Rebalancer trigger params ----------------------------------------
 
@@ -85,6 +103,19 @@ contract Deploy is Script {
     uint256 internal constant MAX_FACTOR_DELTA_BPS = 1000; // 10% per-commit clamp
     uint256 internal constant MIN_COMMIT_INTERVAL = 1 hours;
 
+    // --- Constituent governance params ------------------------------------
+
+    uint256 internal constant ADD_DELAY = 2 days;
+    uint256 internal constant FORCED_REMOVE_DELAY = 6 hours; // fast: only on proven failure
+    uint256 internal constant DISCRETIONARY_REMOVE_DELAY = 7 days; // slow: healthy-asset removal
+    uint256 internal constant MIN_CONSTITUENT_USD = 100_000_000; // $100M whole-USD size floor
+    // Floor on the count after a removal. For a real index set this to
+    // ceil(WAD / capTarget) so capping stays feasible (e.g. 4 at a 25% cap) and
+    // seed at least that many constituents; the two-asset example relaxes it.
+    uint256 internal constant MIN_CONSTITUENT_COUNT = 2;
+    uint256 internal constant MAX_CHANGES_PER_WINDOW = 3;
+    uint256 internal constant CHANGE_WINDOW = 7 days;
+
     struct Constituent {
         address token;
         address feed;
@@ -98,6 +129,8 @@ contract Deploy is Script {
         MarketCapMethodology methodology;
         IndexVault vault;
         Rebalancer rebalancer;
+        ConstituentGovernor governor;
+        TimelockController weightTimelock;
     }
 
     function run() external returns (Deployment memory d) {
@@ -123,6 +156,15 @@ contract Deploy is Script {
 
         vm.startBroadcast(pk);
 
+        // 0. Governance timelock for security-relevant config (the methodology's
+        // weight params). The owner multisig is both proposer and executor, and
+        // the timelock self-administers (admin = address(0)), so role changes
+        // themselves must pass through the delay.
+        address[] memory timelockRoles = new address[](1);
+        timelockRoles[0] = owner;
+        d.weightTimelock =
+            new TimelockController(WEIGHT_PARAMS_TIMELOCK_DELAY, timelockRoles, timelockRoles, address(0));
+
         // 1. Supply-oracle stack. The deployer is the transient owner.
         d.excluded = new ExcludedAddressRegistry(deployer, EXCLUDED_DELAY);
         d.supplyOracle = new SupplyOracle(d.excluded, guardian, deployer);
@@ -144,9 +186,12 @@ contract Deploy is Script {
             d.registry.registerAsset(constituents[i].token, constituents[i].feed, constituents[i].heartbeat);
         }
 
-        // 3. Methodology over the registry + oracle.
-        d.methodology = new MarketCapMethodology(d.registry, ISupplyOracle(address(d.supplyOracle)), deployer);
-        d.methodology.setWeightParams(CAP_TARGET_WAD, CAP_TRIGGER_WAD, FLOOR_WAD);
+        // 3. Methodology over the registry + oracle, owned by the timelock from
+        // construction so weight-param changes carry a delay. No deploy-time
+        // owner call is needed because the built-in defaults are the intended
+        // values; to change them, schedule setWeightParams through the timelock.
+        d.methodology =
+            new MarketCapMethodology(d.registry, ISupplyOracle(address(d.supplyOracle)), address(d.weightTimelock));
 
         // 4. Vault, then install the constituent set.
         d.vault = new IndexVault(IERC20(usdc), d.registry, keeper, deployer);
@@ -179,13 +224,35 @@ contract Deploy is Script {
         }
         d.vault.approveRelayer(usdc);
 
-        // 7. Hand every Ownable contract to the final owner. Done last so all
-        // owner-gated wiring above could run under the deployer.
+        // 7. Constituent governor. It needs no deploy-time owner calls, so it is
+        // owned by the final owner from construction. Wiring it into the vault
+        // locks setConstituents to its pre-governance seeding role above, so this
+        // must run after the seed.
+        d.governor = new ConstituentGovernor(
+            d.vault,
+            d.registry,
+            ISupplyOracle(address(d.supplyOracle)),
+            guardian,
+            owner,
+            ADD_DELAY,
+            FORCED_REMOVE_DELAY,
+            DISCRETIONARY_REMOVE_DELAY,
+            MIN_CONSTITUENT_USD,
+            MIN_CONSTITUENT_COUNT,
+            MAX_CHANGES_PER_WINDOW,
+            CHANGE_WINDOW
+        );
+        d.vault.setGovernor(address(d.governor));
+
+        // 8. Hand every deployer-owned contract to the single top-level owner.
+        // Done last so all owner-gated wiring above could run under the deployer.
+        // Ownable2Step: the new owner must call acceptOwnership() on each.
+        // The methodology is already owned by the timelock; the rest go to the
+        // operational multisig.
         if (owner != deployer) {
             d.excluded.transferOwnership(owner);
             d.supplyOracle.transferOwnership(owner);
             d.registry.transferOwnership(owner);
-            d.methodology.transferOwnership(owner);
             d.vault.transferOwnership(owner);
         }
 
@@ -198,6 +265,8 @@ contract Deploy is Script {
         console2.log("MarketCapMethodology   ", address(d.methodology));
         console2.log("IndexVault             ", address(d.vault));
         console2.log("Rebalancer             ", address(d.rebalancer));
+        console2.log("ConstituentGovernor    ", address(d.governor));
+        console2.log("WeightTimelock         ", address(d.weightTimelock));
     }
 
     /// @dev The starting basket. Edit here (or fork this script per network) to
