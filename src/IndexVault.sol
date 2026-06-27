@@ -92,6 +92,17 @@ error IndexVault_NotWindingDown(address token);
 /// @notice Thrown when finalizing removal before the position has been wound down to dust.
 error IndexVault_PositionNotDust(address token, uint256 valueUsd);
 
+/// @notice Thrown when a deposit or mint is attempted while a held constituent
+/// is quarantined. Mints fail closed because a conservative NAV would over-issue.
+error IndexVault_QuarantineBlocksDeposit();
+
+/// @notice Thrown when settlement is attempted while a held constituent is
+/// quarantined. The async batch is deferred until the feed recovers.
+error IndexVault_QuarantineBlocksSettle();
+
+/// @notice Thrown when quarantine parameters are out of range.
+error IndexVault_InvalidQuarantineParams();
+
 /**
  * @title IndexVault
  * @notice Pooled, single-asset (USDC) index vault. ERC-7540 asynchronous
@@ -255,6 +266,15 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     /// winding-down constituent is considered fully exited and may be removed.
     uint256 public dustThresholdUsd = 1e8;
 
+    /// @notice Haircut applied the moment a constituent's feed goes stale and it
+    /// enters quarantine, sized to the plausible adverse move over the window.
+    uint16 public quarantineHaircutBps = 1000; // 10%
+
+    /// @notice Window over which a quarantined constituent's mark decays from
+    /// (1 - haircut) to zero, measured from the feed's last fresh timestamp. The
+    /// longer a feed stays dead, the closer its mark falls to zero.
+    uint48 public quarantineDecayWindow = 7 days;
+
     // ========================================================================
     // Events
     // ========================================================================
@@ -281,6 +301,7 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     event WindDownBegun(address indexed token);
     event ConstituentRemoved(address indexed token);
     event DustThresholdSet(uint256 dustThresholdUsd);
+    event QuarantineParamsSet(uint16 haircutBps, uint48 decayWindow);
 
     // ========================================================================
     // Construction
@@ -313,16 +334,17 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
      * NAV-per-share ratio stays consistent for both lanes.
      */
     function totalAssets() public view override returns (uint256) {
+        // The USDC numeraire feed still fails closed: it is the unit NAV is quoted
+        // in, not a constituent, so its staleness is a hard failure, not a quarantine.
         uint256 usdcPrice = REGISTRY.getUsdcPriceUsd();
 
         address[] memory cons = _constituents;
         uint256 basketUsd = 0;
         for (uint256 i = 0; i < cons.length; i++) {
-            address token = cons[i];
-            uint256 balance = IERC20(token).balanceOf(address(this));
+            uint256 balance = IERC20(cons[i]).balanceOf(address(this));
             if (balance == 0) continue;
-            uint256 price = REGISTRY.getPriceUsd(token);
-            basketUsd += balance.mulDiv(price, 10 ** _constituentDecimals[token], Math.Rounding.Floor);
+            (uint256 valueUsd,) = _constituentValueUsd(cons[i], balance);
+            basketUsd += valueUsd;
         }
 
         // basketUsd has 8 decimals (registry PRICE_DECIMALS); dividing the USD
@@ -334,6 +356,60 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     /// @notice Idle USDC currently held as buffer.
     function idleAssets() public view returns (uint256) {
         return IERC20(asset()).balanceOf(address(this));
+    }
+
+    /// @dev USD value (8-decimal) of `balance` of `token`, degrading on a stale
+    /// or dead feed instead of reverting. A fresh feed values at full price; a
+    /// stale feed values at its last-good price times a mark factor that starts
+    /// at (1 - haircut) and decays linearly to zero over quarantineDecayWindow; a
+    /// dead feed (non-positive answer) values at zero. Returns whether the
+    /// constituent is quarantined (feed not fresh).
+    function _constituentValueUsd(address token, uint256 balance)
+        private
+        view
+        returns (uint256 valueUsd, bool quarantined)
+    {
+        (uint256 price, uint256 updatedAt, bool fresh) = REGISTRY.getPriceUsdStatus(token);
+        uint256 fullUsd = price == 0 ? 0 : balance.mulDiv(price, 10 ** _constituentDecimals[token], Math.Rounding.Floor);
+        if (fresh) return (fullUsd, false);
+
+        // Quarantined: conservative mark on the last-good price.
+        uint256 markBps = _quarantineMarkBps(updatedAt);
+        return (fullUsd.mulDiv(markBps, BPS, Math.Rounding.Floor), true);
+    }
+
+    /// @dev Quarantine mark factor in bps: (BPS - haircut) when the feed has just
+    /// gone stale, decaying linearly to zero across quarantineDecayWindow. Age is
+    /// measured from the feed's last fresh timestamp, which is marginally more
+    /// conservative than measuring from the heartbeat boundary, the safe direction.
+    function _quarantineMarkBps(uint256 updatedAt) private view returns (uint256) {
+        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+        if (age >= quarantineDecayWindow) return 0;
+        uint256 base = BPS - quarantineHaircutBps;
+        return base.mulDiv(quarantineDecayWindow - age, quarantineDecayWindow, Math.Rounding.Floor);
+    }
+
+    /// @notice Whether `token` is a constituent whose feed is currently stale or
+    /// dead, so it is being valued conservatively in NAV.
+    function isQuarantined(address token) public view returns (bool) {
+        if (!isConstituent[token]) return false;
+        (,, bool fresh) = REGISTRY.getPriceUsdStatus(token);
+        return !fresh;
+    }
+
+    /// @notice Whether any constituent the vault actually holds is quarantined.
+    /// Deposits, mints, and settlement gate on this: a quarantined (undervalued)
+    /// basket must not be minted against, or it would over-issue shares and dilute
+    /// the holders who stay. A zero-balance constituent cannot affect NAV, so a
+    /// stale feed on one the vault does not hold does not block entries.
+    function isAnyQuarantined() public view returns (bool) {
+        address[] memory cons = _constituents;
+        for (uint256 i = 0; i < cons.length; i++) {
+            if (IERC20(cons[i]).balanceOf(address(this)) == 0) continue;
+            (,, bool fresh) = REGISTRY.getPriceUsdStatus(cons[i]);
+            if (!fresh) return true;
+        }
+        return false;
     }
 
     // ========================================================================
@@ -472,9 +548,9 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
         for (uint256 i = 0; i < cons.length; i++) {
             address token = cons[i];
             uint256 balance = IERC20(token).balanceOf(address(this));
-            uint256 valueUsd = balance == 0
-                ? 0
-                : balance.mulDiv(REGISTRY.getPriceUsd(token), 10 ** _constituentDecimals[token], Math.Rounding.Floor);
+            // Degrade on a stale feed, matching totalAssets, so holdings reads
+            // and NAV agree and neither halts on a single quarantined constituent.
+            (uint256 valueUsd,) = balance == 0 ? (uint256(0), false) : _constituentValueUsd(token, balance);
             holdings[i] = Holding({ token: token, balance: balance, valueUsd: valueUsd, weightBps: 0 });
             basketUsd += valueUsd;
         }
@@ -759,6 +835,11 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
         }
         if (block.timestamp < lastSettleTimestamp + minSettleInterval) revert IndexVault_SettleIntervalNotPassed();
         if (block.number <= _lastRequestBlock) revert IndexVault_RequestBlockDelayNotPassed();
+        // Defer the whole async batch while any held constituent is quarantined:
+        // the deposit leg must not mint against a conservative NAV, and netting
+        // both legs at a degraded ratio is unsafe. Sync buffer redemptions remain
+        // open through the degraded NAV; large flows wait for the feed to recover.
+        if (isAnyQuarantined()) revert IndexVault_QuarantineBlocksSettle();
 
         uint256 epochId = currentEpoch;
         EpochData storage epoch = _epochs[epochId];
@@ -831,6 +912,15 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     function setDustThreshold(uint256 dustThresholdUsd_) external onlyOwner {
         dustThresholdUsd = dustThresholdUsd_;
         emit DustThresholdSet(dustThresholdUsd_);
+    }
+
+    /// @notice Sets the quarantine haircut and decay window used to value a
+    /// constituent whose feed has gone stale.
+    function setQuarantineParams(uint16 haircutBps, uint48 decayWindow) external onlyOwner {
+        if (haircutBps >= BPS || decayWindow == 0) revert IndexVault_InvalidQuarantineParams();
+        quarantineHaircutBps = haircutBps;
+        quarantineDecayWindow = decayWindow;
+        emit QuarantineParamsSet(haircutBps, decayWindow);
     }
 
     /// @notice Sets the buffer band. Low and high gate the sync lanes; target
@@ -913,6 +1003,9 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     /// constituent's balanceOf, so a callback token could otherwise reenter, and
     /// the curation policy independently excludes callback tokens.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override nonReentrant {
+        // Mints fail closed under quarantine: a conservative NAV would over-issue
+        // shares to a depositor at the expense of the holders who stay.
+        if (isAnyQuarantined()) revert IndexVault_QuarantineBlocksDeposit();
         super._deposit(caller, receiver, assets, shares);
     }
 
