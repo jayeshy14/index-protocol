@@ -194,6 +194,17 @@ contract AssetRegistry is Ownable2Step {
         return _readFeed(a);
     }
 
+    /// @notice Non-reverting price read for the vault's quarantine path: returns
+    /// the feed's last answer (8 decimals), its `updatedAt`, and whether it is
+    /// fresh. A stale feed still surfaces its last-good answer here rather than
+    /// reverting, so the vault can value the constituent conservatively instead
+    /// of halting NAV. A non-positive answer reports price zero and not fresh.
+    function getPriceUsdStatus(address token) external view returns (uint256 price, uint256 updatedAt, bool fresh) {
+        Asset memory a = _assets[token];
+        if (a.token == address(0)) revert AssetRegistry_NotRegistered(token);
+        return _readFeedStatus(a);
+    }
+
     // ========================================================================
     // Internal
     // ========================================================================
@@ -205,10 +216,23 @@ contract AssetRegistry is Ownable2Step {
         if (block.timestamp > updatedAt + a.heartbeat) {
             revert AssetRegistry_StalePrice(a.feed, updatedAt, a.heartbeat);
         }
+        return _normalizePrice(uint256(answer), a.feedDecimals);
+    }
 
-        uint256 price = uint256(answer);
-        if (a.feedDecimals == PRICE_DECIMALS) return price;
-        if (a.feedDecimals < PRICE_DECIMALS) return price * 10 ** (PRICE_DECIMALS - a.feedDecimals);
-        return price / 10 ** (a.feedDecimals - PRICE_DECIMALS);
+    /// @dev Non-reverting feed read: normalizes the last answer and reports
+    /// freshness. A non-positive answer yields price zero and fresh false.
+    function _readFeedStatus(Asset memory a) internal view returns (uint256 price, uint256 updatedAt, bool fresh) {
+        int256 answer;
+        (, answer,, updatedAt,) = IAggregatorV3(a.feed).latestRoundData();
+        if (answer <= 0) return (0, updatedAt, false);
+        price = _normalizePrice(uint256(answer), a.feedDecimals);
+        fresh = block.timestamp <= updatedAt + a.heartbeat;
+    }
+
+    /// @dev Normalizes a raw feed answer to the registry's 8-decimal convention.
+    function _normalizePrice(uint256 raw, uint8 feedDecimals) private pure returns (uint256) {
+        if (feedDecimals == PRICE_DECIMALS) return raw;
+        if (feedDecimals < PRICE_DECIMALS) return raw * 10 ** (PRICE_DECIMALS - feedDecimals);
+        return raw / 10 ** (feedDecimals - PRICE_DECIMALS);
     }
 }
