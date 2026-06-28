@@ -103,6 +103,15 @@ error IndexVault_QuarantineBlocksSettle();
 /// @notice Thrown when quarantine parameters are out of range.
 error IndexVault_InvalidQuarantineParams();
 
+/// @notice Thrown when a value-moving operation is attempted while paused.
+error IndexVault_Paused();
+
+/// @notice Thrown when a guardian-gated function is called by another address.
+error IndexVault_NotGuardian(address caller);
+
+/// @notice Thrown when the max NAV deviation band is out of range.
+error IndexVault_InvalidNavDeviation();
+
 /**
  * @title IndexVault
  * @notice Pooled, single-asset (USDC) index vault. ERC-7540 asynchronous
@@ -174,6 +183,10 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     // ========================================================================
 
     uint256 private constant BPS = 10_000;
+
+    /// @dev One whole share (18 decimals), the unit the NAV-per-share circuit
+    /// breaker measures the share price in via convertToAssets.
+    uint256 private constant WAD = 1e18;
 
     /// @notice Shared asset catalog this index draws constituents from and prices NAV through.
     AssetRegistry public immutable REGISTRY;
@@ -275,6 +288,25 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     /// longer a feed stays dead, the closer its mark falls to zero.
     uint48 public quarantineDecayWindow = 7 days;
 
+    /// @notice Address allowed to pause the vault (the systemic emergency brake),
+    /// distinct from the keeper and the owner.
+    address public guardian;
+
+    /// @notice When true, all value-moving operations are halted. Set by the
+    /// guardian, by the owner, or automatically by the NAV circuit breaker.
+    bool public paused;
+
+    /// @notice Largest NAV-per-share move tolerated between settlements before
+    /// the circuit breaker trips. Sized to catch an implausible jump (a
+    /// compromised token doubling, a correlated oracle failure), while tolerating
+    /// even severe real volatility, so a legitimate move does not false-trip and
+    /// train operators to reflexively unpause. Owner-tunable per index.
+    uint16 public maxNavDeviationBps = 5000; // 50%
+
+    /// @notice Reference NAV per share (assets per 1e18 shares) from the last
+    /// settlement, against which the circuit breaker measures the next move.
+    uint256 public lastSettleNavPerShare;
+
     // ========================================================================
     // Events
     // ========================================================================
@@ -302,6 +334,11 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     event ConstituentRemoved(address indexed token);
     event DustThresholdSet(uint256 dustThresholdUsd);
     event QuarantineParamsSet(uint16 haircutBps, uint48 decayWindow);
+    event GuardianSet(address indexed guardian);
+    event Paused(address indexed by);
+    event Unpaused(address indexed by);
+    event CircuitBreakerTripped(uint256 referenceNav, uint256 currentNav);
+    event MaxNavDeviationSet(uint16 bps);
 
     // ========================================================================
     // Construction
@@ -447,6 +484,14 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
         }
 
         emit ConstituentsSet(tokens);
+    }
+
+    /// @dev Halts value-moving operations while the vault is paused (guardian
+    /// brake or a tripped circuit breaker). Already-settled claims are not gated,
+    /// since their value was fixed at a prior validated settlement.
+    modifier whenNotPaused() {
+        if (paused) revert IndexVault_Paused();
+        _;
     }
 
     /// @dev Restricts membership mutation to the governor, which enforces the
@@ -647,6 +692,7 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     function requestDeposit(uint256 assets, address controller, address owner)
         external
         nonReentrant
+        whenNotPaused
         returns (uint256 requestId)
     {
         if (assets == 0) revert IndexVault_ZeroAmount();
@@ -680,6 +726,7 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     function requestRedeem(uint256 shares, address controller, address owner)
         external
         nonReentrant
+        whenNotPaused
         returns (uint256 requestId)
     {
         if (shares == 0) revert IndexVault_ZeroAmount();
@@ -829,7 +876,7 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
      * settlement, callable by anyone as a liveness backstop. Must be at least
      * one block after the most recent request (flash-loan protection).
      */
-    function settle() external nonReentrant {
+    function settle() external nonReentrant whenNotPaused {
         if (msg.sender != keeper) {
             if (block.timestamp < lastSettleTimestamp + maxSettleDelay) revert IndexVault_NotKeeper(msg.sender);
         }
@@ -840,6 +887,24 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
         // both legs at a degraded ratio is unsafe. Sync buffer redemptions remain
         // open through the degraded NAV; large flows wait for the feed to recover.
         if (isAnyQuarantined()) revert IndexVault_QuarantineBlocksSettle();
+
+        // NAV-per-share circuit breaker. A move beyond the band since the last
+        // settlement signals a collective mispricing (a compromised constituent
+        // token or a correlated oracle failure) even when every feed passes its
+        // own staleness check. On breach, pause and return WITHOUT reverting:
+        // reverting would roll back the pause, so the breaker persists the pause
+        // and lets settlement not proceed, halting the vault for guardian review
+        // before any pending membership change can autonomously execute.
+        uint256 navPerShare = convertToAssets(WAD);
+        uint256 ref = lastSettleNavPerShare;
+        if (ref != 0) {
+            uint256 diff = navPerShare > ref ? navPerShare - ref : ref - navPerShare;
+            if (diff * BPS > ref * maxNavDeviationBps) {
+                paused = true;
+                emit CircuitBreakerTripped(ref, navPerShare);
+                return;
+            }
+        }
 
         uint256 epochId = currentEpoch;
         EpochData storage epoch = _epochs[epochId];
@@ -883,6 +948,9 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
             IERC20(asset()).safeTransfer(address(SILO), assetsToPay);
         }
 
+        // Update the circuit-breaker reference to the freshly settled share price.
+        lastSettleNavPerShare = convertToAssets(WAD);
+
         emit Settled(epochId, ta, supply, depositAssets, sharesToMint, redeemShares, assetsToPay);
     }
 
@@ -921,6 +989,38 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
         quarantineHaircutBps = haircutBps;
         quarantineDecayWindow = decayWindow;
         emit QuarantineParamsSet(haircutBps, decayWindow);
+    }
+
+    /// @notice Sets the guardian, the address allowed to pause the vault.
+    function setGuardian(address guardian_) external onlyOwner {
+        if (guardian_ == address(0)) revert IndexVault_ZeroAddress();
+        guardian = guardian_;
+        emit GuardianSet(guardian_);
+    }
+
+    /// @notice Halts all value-moving operations. Callable by the guardian (the
+    /// fast emergency brake) or the owner; the NAV circuit breaker also sets this
+    /// automatically. Pause stops execution, not clocks: timelocks keep elapsing.
+    function pause() external {
+        if (msg.sender != guardian && msg.sender != owner()) revert IndexVault_NotGuardian(msg.sender);
+        paused = true;
+        emit Paused(msg.sender);
+    }
+
+    /// @notice Resumes operations after guardian review. Owner-gated, since
+    /// unpausing is a deliberate governance act. The circuit-breaker reference is
+    /// reset to the current share price so a resolved deviation cannot re-trip.
+    function unpause() external onlyOwner {
+        paused = false;
+        lastSettleNavPerShare = convertToAssets(WAD);
+        emit Unpaused(msg.sender);
+    }
+
+    /// @notice Sets the NAV-per-share deviation band that trips the circuit breaker.
+    function setMaxNavDeviation(uint16 bps) external onlyOwner {
+        if (bps == 0 || bps > BPS) revert IndexVault_InvalidNavDeviation();
+        maxNavDeviationBps = bps;
+        emit MaxNavDeviationSet(bps);
     }
 
     /// @notice Sets the buffer band. Low and high gate the sync lanes; target
@@ -975,6 +1075,7 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     /// @param digest The order digest the settlement computed.
     /// @param signature The ABI-encoded GPv2Order for that trade.
     function isValidSignature(bytes32 digest, bytes calldata signature) external view returns (bytes4) {
+        if (paused) revert IndexVault_Paused();
         if (rebalancer == address(0)) revert IndexVault_RebalancerNotSet();
 
         GPv2Order.Data memory order = abi.decode(signature, (GPv2Order.Data));
@@ -1002,7 +1103,12 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
     /// there is no nested-guard reversion. Defense in depth: NAV reads a
     /// constituent's balanceOf, so a callback token could otherwise reenter, and
     /// the curation policy independently excludes callback tokens.
-    function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override nonReentrant {
+    function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
+        internal
+        override
+        nonReentrant
+        whenNotPaused
+    {
         // Mints fail closed under quarantine: a conservative NAV would over-issue
         // shares to a depositor at the expense of the holders who stay.
         if (isAnyQuarantined()) revert IndexVault_QuarantineBlocksDeposit();
@@ -1013,6 +1119,7 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
         internal
         override
         nonReentrant
+        whenNotPaused
     {
         super._withdraw(caller, receiver, owner, assets, shares);
     }
