@@ -188,13 +188,18 @@ contract Rebalancer {
         }
         delete _epochConstituents;
 
-        // Snapshot the new target: weight times NAV per constituent.
-        address[] memory constituents = VAULT.getConstituents();
-        uint256[] memory weights = METHODOLOGY.getWeights(constituents);
+        // Snapshot the new target over the FRESH constituents only. A quarantined
+        // (stale-feed) constituent cannot be priced, so the methodology cannot
+        // weight it and the rebalancer cannot anchor a minimum-out to sell it
+        // (Section 16.5). It is excluded from the epoch entirely, neither bought
+        // nor sold, and held marked-down (Section 4) until its feed recovers; the
+        // healthy names rebalance around it instead of the whole epoch halting.
+        address[] memory fresh = _freshSubset(VAULT.getConstituents());
+        uint256[] memory weights = METHODOLOGY.getWeights(fresh);
         (,, uint256 navUsd) = VAULT.getHoldings();
 
-        for (uint256 i = 0; i < constituents.length; i++) {
-            address token = constituents[i];
+        for (uint256 i = 0; i < fresh.length; i++) {
+            address token = fresh[i];
             // A constituent marked for wind-down targets zero, so the whole
             // position becomes overweight and is sold to USDC at the
             // oracle-anchored minimum-out (Section 16.5, wind-down not dump).
@@ -210,7 +215,7 @@ contract Rebalancer {
             epochId++;
         }
 
-        emit EpochOpened(epochId, navUsd, constituents.length);
+        emit EpochOpened(epochId, navUsd, fresh.length);
     }
 
     // ========================================================================
@@ -225,17 +230,30 @@ contract Rebalancer {
         address[] memory cons = VAULT.getConstituents();
         if (cons.length == 0) return 0;
 
-        uint256[] memory weights = METHODOLOGY.getWeights(cons);
+        // Weight over the fresh subset only, so a single stale feed does not
+        // revert the drift read (and therefore the trigger). Quarantined names
+        // are skipped: they are held, not rebalanced.
+        address[] memory fresh = _freshSubset(cons);
+        if (fresh.length == 0) return 0;
+        uint256[] memory weights = METHODOLOGY.getWeights(fresh);
         (IndexVault.Holding[] memory holdings,, uint256 navUsd) = VAULT.getHoldings();
         if (navUsd == 0) return 0;
 
+        // `holdings` is parallel to the full constituent list; `weights` is over
+        // the fresh subset in the same order, so a fresh-index cursor keeps them
+        // aligned as the loop skips quarantined names.
+        uint256 fi = 0;
         for (uint256 i = 0; i < cons.length; i++) {
+            if (VAULT.isQuarantined(cons[i])) continue;
             // A winding-down constituent targets zero, so its full held weight
             // reads as drift and pulls the index toward opening an exit epoch.
-            uint256 targetBps = VAULT.windingDown(cons[i]) ? 0 : weights[i].mulDiv(BPS, WAD, Math.Rounding.Floor);
+            uint256 targetBps = VAULT.windingDown(cons[i]) ? 0 : weights[fi].mulDiv(BPS, WAD, Math.Rounding.Floor);
             uint256 actualBps = holdings[i].weightBps;
             uint256 d = actualBps > targetBps ? actualBps - targetBps : targetBps - actualBps;
             if (d > maxBps) maxBps = d;
+            unchecked {
+                fi++;
+            }
         }
     }
 
@@ -371,6 +389,26 @@ contract Rebalancer {
     // ========================================================================
     // Internal
     // ========================================================================
+
+    /// @dev The constituents whose feeds are fresh (not quarantined), in the same
+    /// order as `cons`. Weighting and rebalancing operate over this subset so a
+    /// single stale feed does not halt the whole epoch.
+    function _freshSubset(address[] memory cons) internal view returns (address[] memory fresh) {
+        uint256 n = 0;
+        for (uint256 i = 0; i < cons.length; i++) {
+            if (!VAULT.isQuarantined(cons[i])) n++;
+        }
+        fresh = new address[](n);
+        uint256 j = 0;
+        for (uint256 i = 0; i < cons.length; i++) {
+            if (!VAULT.isQuarantined(cons[i])) {
+                fresh[j] = cons[i];
+                unchecked {
+                    j++;
+                }
+            }
+        }
+    }
 
     function _baseOrder(
         address sellToken,
