@@ -171,13 +171,22 @@ contract Rebalancer {
         }
 
         uint256 drift = maxDriftBps();
-        if (drift < D_LARGE_BPS) {
-            // Not an emergency: scheduled path, keeper plus cadence plus small gate.
+        // A redemption the buffer cannot cover is a first-class trigger: the
+        // keeper may open an epoch to free USDC from the basket regardless of
+        // drift or cadence, because redemption liveness cannot wait for the
+        // reweight schedule (Section 3). The min-interval floor still applies.
+        bool fundingNeeded = VAULT.redemptionFundingNeeded();
+        if (drift < D_LARGE_BPS && !fundingNeeded) {
+            // Not an emergency and no funding need: scheduled reweight path,
+            // keeper plus cadence plus small gate.
             if (msg.sender != KEEPER) revert Rebalancer_NotKeeper(msg.sender);
             if (epochId != 0 && block.timestamp < epochOpenedAt + CADENCE) {
                 revert Rebalancer_CadenceNotElapsed(epochOpenedAt + CADENCE);
             }
             if (drift < D_SMALL_BPS) revert Rebalancer_BelowDriftThreshold(drift, D_SMALL_BPS);
+        } else if (fundingNeeded && drift < D_LARGE_BPS) {
+            // Funding open below the emergency band is keeper-gated.
+            if (msg.sender != KEEPER) revert Rebalancer_NotKeeper(msg.sender);
         }
 
         // Clear the previous snapshot.
@@ -198,12 +207,25 @@ contract Rebalancer {
         uint256[] memory weights = METHODOLOGY.getWeights(fresh);
         (,, uint256 navUsd) = VAULT.getHoldings();
 
+        // Hold back a USDC reserve for pending redemptions the buffer cannot
+        // cover, then weight the constituents over the deployable remainder. This
+        // makes the basket overweight relative to its targets, so it is sold to
+        // USDC and the redemption is funded before settle pays it (Section 3).
+        uint256 reserveUsd = VAULT.rebalanceReserveUsd();
+        if (reserveUsd > 0) {
+            // Selling the basket nets only (1 - slippage) of oracle value, so
+            // gross the reserve up by the max slippage; otherwise the USDC raised
+            // would fall a haircut short of the redemption it must fund.
+            reserveUsd = reserveUsd.mulDiv(BPS, BPS - MAX_SLIPPAGE_BPS, Math.Rounding.Ceil);
+        }
+        uint256 deployableNav = navUsd > reserveUsd ? navUsd - reserveUsd : 0;
+
         for (uint256 i = 0; i < fresh.length; i++) {
             address token = fresh[i];
             // A constituent marked for wind-down targets zero, so the whole
             // position becomes overweight and is sold to USDC at the
             // oracle-anchored minimum-out (Section 16.5, wind-down not dump).
-            uint256 target = VAULT.windingDown(token) ? 0 : navUsd.mulDiv(weights[i], WAD, Math.Rounding.Floor);
+            uint256 target = VAULT.windingDown(token) ? 0 : deployableNav.mulDiv(weights[i], WAD, Math.Rounding.Floor);
             targetUsd[token] = target;
             inEpoch[token] = true;
             _epochConstituents.push(token);

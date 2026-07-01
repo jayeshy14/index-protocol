@@ -395,6 +395,31 @@ contract IndexVault is ERC4626, Ownable2Step, IERC7540, ReentrancyGuard {
         return IERC20(asset()).balanceOf(address(this));
     }
 
+    /// @notice USDC value of the current epoch's pending redemptions, at NAV.
+    function pendingRedeemAssets() public view returns (uint256) {
+        uint256 shares = _epochs[currentEpoch].pendingRedeemShares;
+        return shares == 0 ? 0 : convertToAssets(shares);
+    }
+
+    /// @notice Whether the current epoch's pending redemptions exceed the idle
+    /// buffer, so the rebalancer must free USDC from the basket before settle can
+    /// pay them. This is a first-class rebalance trigger (Section 3).
+    function redemptionFundingNeeded() external view returns (bool) {
+        return pendingRedeemAssets() > idleAssets();
+    }
+
+    /// @notice USD (8-decimal, matching the rebalancer's targets) the rebalancer
+    /// should hold back as USDC when it opens an epoch: the full value of the
+    /// pending redemptions. Targeting the constituents over `NAV - reserve`
+    /// leaves that much USDC, and since NAV already includes the existing buffer,
+    /// the basket only sells the shortfall down to reach it. Zero when the buffer
+    /// already covers redemptions, so a pure reweight is unaffected.
+    function rebalanceReserveUsd() external view returns (uint256) {
+        uint256 pendingUsdc = pendingRedeemAssets();
+        if (pendingUsdc <= idleAssets()) return 0;
+        return pendingUsdc.mulDiv(REGISTRY.getUsdcPriceUsd(), _ASSET_UNIT, Math.Rounding.Ceil);
+    }
+
     /// @dev USD value (8-decimal) of `balance` of `token`, degrading on a stale
     /// or dead feed instead of reverting. A fresh feed values at full price; a
     /// stale feed values at its last-good price times a mark factor that starts
